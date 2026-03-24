@@ -1,2 +1,0 @@
-C:\Users\Maria\Desktop\Universidad\´Tercero\Segundo cuatri\PAP\Lab\Practica\pap_air\PL1_CUDA\x64\Debug\PL1_CUDA.exe
-C:\Users\Maria\Desktop\Universidad\Tercero\Segundo cuatri\PAP\Lab\Practica\pap_air\PL1_CUDA\x64\Debug\PL1_CUDA.exe
