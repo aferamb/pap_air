@@ -1,67 +1,90 @@
-// csv_reader.cpp
-// Funciones para leer el dataset CSV
-// Cada columna relevante se guarda en un vector unidimensional
-// Valores faltantes se representan con NAN
-
-#include <iostream>
+Ôªø#include "csv_reader.h"
 #include <fstream>
 #include <sstream>
-#include <vector>
-#include <string>
-#include <cmath> // para NAN
+#include <iostream>
 
-// Estructura para almacenar columnas relevantes del dataset
-struct FlightData {
-    std::vector<float> dep_delay;     // Retraso en despegue
-    std::vector<float> arr_delay;     // Retraso en aterrizaje
-    std::vector<float> weather_delay; // Retraso por clima
-    std::vector<std::string> tail_num;// MatrÌcula del aviÛn
-};
+/*
+    Funci√≥n: loadCSV
+    Lee el fichero CSV y extrae las columnas:
+        - DEP_DELAY (columna 10)
+        - ARR_DELAY (columna 12)
+        - WEATHER_DELAY (columna 13)
 
-// FunciÛn para leer CSV y devolver FlightData
-FlightData readCSV(const std::string& filename) {
-    FlightData data;
+    - Convierte valores a float y luego a int (truncado)
+    - Ignora valores no v√°lidos
+*/
+
+std::vector<FlightData> loadCSV(const std::string& filename) {
+
+    std::vector<FlightData> data;
     std::ifstream file(filename);
-    std::string line;
 
     if (!file.is_open()) {
-        std::cerr << "No se pudo abrir el CSV\n";
+        std::cerr << "Error abriendo archivo: " << filename << std::endl;
         return data;
     }
 
-    // Saltar la primera lÌnea (cabecera)
+    std::cout << "Archivo abierto correctamente\n";
+
+    std::string line;
+
+    // Leer cabecera
     std::getline(file, line);
+    std::cout << "Cabecera: " << line << std::endl;
 
-    // Leer lÌnea por lÌnea
+    int line_count = 0;
+
     while (std::getline(file, line)) {
+
+        line_count++;
+        // Mostrar progreso cada cierto n√∫mero de l√≠neas
+        if (line_count % 100000 == 0) {
+            std::cout << "Procesadas " << line_count << " lineas...\n" << std::flush;
+        }
+
         std::stringstream ss(line);
-        std::string item;
+        std::string value;
 
-        // Columna DEP_DELAY
-        std::getline(ss, item, ',');
-        try {
-            data.dep_delay.push_back(std::stof(item));
+        FlightData flight{ 0, 0, 0 };
+        bool valid = false;
+
+        int col = 0;
+
+        while (std::getline(ss, value, ',')) {
+
+            try {
+                // Limpiar comillas si existen
+                if (!value.empty() && value.front() == '"')
+                    value.erase(0, 1);
+
+                if (!value.empty() && value.back() == '"')
+                    value.pop_back();
+
+                int val = static_cast<int>(std::stof(value));
+
+                // √çndices seg√∫n dataset
+                if (col == 10) { flight.dep_delay = val; valid = true; }
+                if (col == 12) { flight.arr_delay = val; valid = true; }
+                if (col == 13) {
+                    flight.weather_delay = val; valid = true;
+
+                }
+
+            }
+            catch (...) {
+                // Ignorar valores no num√©ricos
+            }
+
+            col++;
         }
-        catch (...) { data.dep_delay.push_back(NAN); }
 
-        // Columna ARR_DELAY
-        std::getline(ss, item, ',');
-        try {
-            data.arr_delay.push_back(std::stof(item));
+        // Solo guardamos si hay datos v√°lidos
+        if (valid) {
+            data.push_back(flight);
         }
-        catch (...) { data.arr_delay.push_back(NAN); }
-
-        // Columna WEATHER_DELAY
-        std::getline(ss, item, ',');
-        try {
-            data.weather_delay.push_back(std::stof(item));
-        }
-        catch (...) { data.weather_delay.push_back(NAN); }
-
-        // Columna TAIL_NUM
-        std::getline(ss, item, ',');
-        data.tail_num.push_back(item);
     }
+
+    std::cout << "Total l√≠neas procesadas: " << data.size() << std::endl;
 
     return data;
 }

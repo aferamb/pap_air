@@ -1,16 +1,2 @@
-﻿  Compiling CUDA source file src\kernels.cu...
-  Compiling CUDA source file src\main.cu...
-  
-  C:\Users\Maria\Desktop\Universidad\´Tercero\Segundo cuatri\PAP\Lab\Practica\pap_air\PL1_CUDA>"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8\bin\nvcc.exe" -gencode=arch=compute_52,code=\"sm_52,compute_52\" --use-local-env -ccbin "C:\Program Files (x86)\Microsoft Visual Studio\2019\Enterprise\VC\Tools\MSVC\14.29.30133\bin\HostX86\x64" -x cu   -I"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8\include" -I"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8\include"  -G   --keep-dir x64\Debug  -maxrregcount=0  --machine 64 --compile -cudart static  -g  -DWIN32 -DWIN64 -D_DEBUG -D_CONSOLE -D_MBCS -Xcompiler "/EHsc /W3 /nologo /Od /Fdx64\Debug\vc142.pdb /FS /Zi /RTC1 /MDd " -o "C:\Users\Maria\Desktop\Universidad\´Tercero\Segundo cuatri\PAP\Lab\Practica\pap_air\PL1_CUDA\x64\Debug\kernels.cu.obj" "C:\Users\Maria\Desktop\Universidad\´Tercero\Segundo cuatri\PAP\Lab\Practica\pap_air\PL1_CUDA\src\kernels.cu" 
-  
-  C:\Users\Maria\Desktop\Universidad\´Tercero\Segundo cuatri\PAP\Lab\Practica\pap_air\PL1_CUDA>"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8\bin\nvcc.exe" -gencode=arch=compute_52,code=\"sm_52,compute_52\" --use-local-env -ccbin "C:\Program Files (x86)\Microsoft Visual Studio\2019\Enterprise\VC\Tools\MSVC\14.29.30133\bin\HostX86\x64" -x cu   -I"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8\include" -I"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8\include"  -G   --keep-dir x64\Debug  -maxrregcount=0  --machine 64 --compile -cudart static  -g  -DWIN32 -DWIN64 -D_DEBUG -D_CONSOLE -D_MBCS -Xcompiler "/EHsc /W3 /nologo /Od /Fdx64\Debug\vc142.pdb /FS /Zi /RTC1 /MDd " -o "C:\Users\Maria\Desktop\Universidad\´Tercero\Segundo cuatri\PAP\Lab\Practica\pap_air\PL1_CUDA\x64\Debug\main.cu.obj" "C:\Users\Maria\Desktop\Universidad\´Tercero\Segundo cuatri\PAP\Lab\Practica\pap_air\PL1_CUDA\src\main.cu" 
-  kernels.cu
-  main.cu
-C:\Users\Maria\Desktop\Universidad\´Tercero\Segundo cuatri\PAP\Lab\Practica\pap_air\PL1_CUDA\src\main.cu(40): warning C4267: 'inicializando': conversión de 'size_t' a 'int'; posible pérdida de datos
-C:\Users\Maria\Desktop\Universidad\´Tercero\Segundo cuatri\PAP\Lab\Practica\pap_air\PL1_CUDA\src\main.cu(44): warning C4267: 'argumento': conversión de 'size_t' a 'int'; posible pérdida de datos
-     Creando biblioteca C:\Users\Maria\Desktop\Universidad\´Tercero\Segundo cuatri\PAP\Lab\Practica\pap_air\PL1_CUDA\x64\Debug\PL1_CUDA.lib y objeto C:\Users\Maria\Desktop\Universidad\´Tercero\Segundo cuatri\PAP\Lab\Practica\pap_air\PL1_CUDA\x64\Debug\PL1_CUDA.exp
-LINK : warning LNK4098: la biblioteca predeterminada'LIBCMT' entra en conflicto con otras bibliotecas; use la biblioteca /NODEFAULTLIB:biblioteca
-main.cu.obj : error LNK2019: símbolo externo "void __cdecl depDelayKernel(float *,int,float)" (?depDelayKernel@@YAXPEAMHM@Z) sin resolver al que se hace referencia en la función main
-    Sugerencia sobre los símbolos definidos que podrían coincidir:
-      "void __cdecl depDelayKernel(float *,unsigned __int64,float)" (?depDelayKernel@@YAXPEAM_KM@Z)
-C:\Users\Maria\Desktop\Universidad\´Tercero\Segundo cuatri\PAP\Lab\Practica\pap_air\PL1_CUDA\x64\Debug\PL1_CUDA.exe : fatal error LNK1120: 1 externos sin resolver
+﻿  csv_reader.cpp
+  PL1_CUDA.vcxproj -> C:\Users\Maria\Desktop\Universidad\Tercero\Segundo cuatri\PAP\Lab\Practica\pap_air\PL1_CUDA\x64\Debug\PL1_CUDA.exe

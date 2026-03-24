@@ -1,14 +1,13 @@
 #pragma once
 #include <vector>
 #include <string>
-#include <cmath> // para NAN
 
+// Estructura que almacena los campos relevantes del dataset
 struct FlightData {
-    std::vector<float> dep_delay;
-    std::vector<float> arr_delay;
-    std::vector<float> weather_delay;
-    std::vector<std::string> tail_num;
+    int dep_delay;
+    int arr_delay;
+    int weather_delay;
 };
 
-// Declaración de la función
-FlightData readCSV(const std::string& filename);
+// Función que carga el CSV completo
+std::vector<FlightData> loadCSV(const std::string& filename);
