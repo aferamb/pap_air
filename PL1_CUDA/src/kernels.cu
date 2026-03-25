@@ -1,22 +1,33 @@
 #include "kernels.cuh"
+
 #include <limits.h>
 
 /*
     Kernel:
     - Cada hilo procesa un elemento
-    - Usa operaciones atómicas globales
+    - Usa operaciones atï¿½micas globales
 */
 
 __global__ void reductionSimple(int* data, int* result, int n, bool isMax)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    // Formula clasica de acceso linealizado 1D en CUDA.
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
-    if (idx >= n) return;
+    // Si sobran hilos respecto al tamano real del vector, esos hilos salen
+    // inmediatamente para no leer fuera de rango.
+    if (idx >= n) {
+        return;
+    }
 
-    int value = data[idx];
+    // Cada hilo solo lee el elemento que le corresponde dentro del vector.
+    const int value = data[idx];
 
-    if (isMax)
+    // La rama selecciona el tipo de reduccion pedido por el host. Ambas usan
+    // operaciones atomicas porque varios hilos pueden intentar actualizar el
+    // mismo acumulador global al mismo tiempo.
+    if (isMax) {
         atomicMax(result, value);
-    else
+    } else {
         atomicMin(result, value);
+    }
 }

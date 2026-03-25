@@ -11,6 +11,7 @@
 *.user
 *.userosscache
 *.sln.docstates
+PL1_CUDA/cuda.local.props
 
 # Visual Studio and CUDA build outputs
 [Dd]ebug/
@@ -39,3 +40,9 @@ ipch/
 *.vsidx
 *.sqlite
 *.FileListAbsolute.txt
+AGENTS.md
+enunciado_pl1_markdown.md
+PL1_CUDA/src/data/Airline_dataset.csv
+PLAN_PRACTICA_PL1.md
+CppProperties.json
+PL1_CUDA/cuda.local.props.example

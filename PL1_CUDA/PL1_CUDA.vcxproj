@@ -19,18 +19,36 @@
     <ConfigurationType>Application</ConfigurationType>
     <UseDebugLibraries>true</UseDebugLibraries>
     <CharacterSet>MultiByte</CharacterSet>
-    <PlatformToolset>v142</PlatformToolset>
+    <PlatformToolset>v143</PlatformToolset>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
     <ConfigurationType>Application</ConfigurationType>
     <UseDebugLibraries>false</UseDebugLibraries>
     <WholeProgramOptimization>true</WholeProgramOptimization>
     <CharacterSet>MultiByte</CharacterSet>
-    <PlatformToolset>v142</PlatformToolset>
+    <PlatformToolset>v143</PlatformToolset>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <!--
+    Cada desarrollador puede definir su version concreta de CUDA en
+    PL1_CUDA/cuda.local.props, que esta ignorado por git. Si ese archivo no
+    existe, el proyecto intenta deducir la version desde la variable de
+    entorno CUDA_PATH para no obligar a crear configuracion local en los casos
+    mas comunes.
+  -->
+  <PropertyGroup>
+    <CudaToolkitCustomDir Condition="'$(CudaToolkitCustomDir)'==''">$(CUDA_PATH)</CudaToolkitCustomDir>
+  </PropertyGroup>
+  <Import Project="cuda.local.props" Condition="exists('cuda.local.props')" />
+  <PropertyGroup>
+    <CudaBuildCustomizationVersion Condition="'$(CudaBuildCustomizationVersion)'=='' and '$(CUDA_PATH)'!=''">$([System.Text.RegularExpressions.Regex]::Match('$(CUDA_PATH)', '[0-9]+\.[0-9]+').Value)</CudaBuildCustomizationVersion>
+  </PropertyGroup>
+  <PropertyGroup>
+    <CudaBuildCustomizationPropsPath Condition="'$(CudaBuildCustomizationVersion)'!=''">$(VCTargetsPath)\BuildCustomizations\CUDA $(CudaBuildCustomizationVersion).props</CudaBuildCustomizationPropsPath>
+    <CudaBuildCustomizationTargetsPath Condition="'$(CudaBuildCustomizationVersion)'!=''">$(VCTargetsPath)\BuildCustomizations\CUDA $(CudaBuildCustomizationVersion).targets</CudaBuildCustomizationTargetsPath>
+  </PropertyGroup>
   <ImportGroup Label="ExtensionSettings">
-    <Import Project="$(VCTargetsPath)\BuildCustomizations\CUDA 11.8.props" />
+    <Import Project="$(CudaBuildCustomizationPropsPath)" Condition="'$(CudaBuildCustomizationPropsPath)'!='' and exists('$(CudaBuildCustomizationPropsPath)')" />
   </ImportGroup>
   <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
@@ -41,6 +59,10 @@
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <LinkIncremental>true</LinkIncremental>
+    <LocalDebuggerWorkingDirectory>$(ProjectDir)</LocalDebuggerWorkingDirectory>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <LocalDebuggerWorkingDirectory>$(ProjectDir)</LocalDebuggerWorkingDirectory>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
@@ -81,17 +103,25 @@
     <CudaCompile Include="src\main.cu" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="src\cli_utils.h" />
     <ClInclude Include="src\csv_reader.h" />
     <ClInclude Include="src\kernels.cuh" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="src\cli_utils.cpp" />
     <ClCompile Include="src\csv_reader.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <None Include="data\Airline_dataset.csv" />
+    <None Include="cuda.local.props.example" />
+    <None Include="src\data\Airline_dataset.csv" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Target Name="ValidateLocalCudaConfiguration" BeforeTargets="PrepareForBuild">
+    <Error Condition="'$(CudaBuildCustomizationVersion)'==''" Text="No se pudo deducir la version de CUDA. Define CUDA_PATH correctamente o copia PL1_CUDA\\cuda.local.props.example a PL1_CUDA\\cuda.local.props y ajusta CudaBuildCustomizationVersion y CudaToolkitCustomDir." />
+    <Error Condition="'$(CudaBuildCustomizationPropsPath)'=='' or !exists('$(CudaBuildCustomizationPropsPath)')" Text="No se ha encontrado la Build Customization de CUDA '$(CudaBuildCustomizationVersion)' en '$(CudaBuildCustomizationPropsPath)'. Instala esa version de CUDA o ajusta PL1_CUDA\\cuda.local.props." />
+    <Error Condition="'$(CudaToolkitCustomDir)'=='' or !exists('$(CudaToolkitCustomDir)')" Text="La ruta de CUDA '$(CudaToolkitCustomDir)' no existe. Corrige CUDA_PATH o ajusta CudaToolkitCustomDir en PL1_CUDA\\cuda.local.props." />
+  </Target>
   <ImportGroup Label="ExtensionTargets">
-    <Import Project="$(VCTargetsPath)\BuildCustomizations\CUDA 11.8.targets" />
+    <Import Project="$(CudaBuildCustomizationTargetsPath)" Condition="'$(CudaBuildCustomizationTargetsPath)'!='' and exists('$(CudaBuildCustomizationTargetsPath)')" />
   </ImportGroup>
 </Project>

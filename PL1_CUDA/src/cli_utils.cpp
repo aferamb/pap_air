@@ -1,0 +1,334 @@
+#include "cli_utils.h"
+
+#include <cctype>
+#include <fstream>
+#include <iostream>
+#include <sstream>
+
+/*
+    cli_utils.cpp
+
+    Implementa la capa de entrada y salida por consola del estado actual del
+    proyecto. Todo lo que hay aqui trabaja en host y evita que main.cu tenga
+    que mezclar validacion de texto con la logica general del programa.
+*/
+
+namespace {
+
+/*
+    trimWhitespace
+
+    Normaliza una cadena eliminando espacios exteriores. Se usa antes de
+    interpretar cualquier entrada del usuario para evitar errores por espacios.
+*/
+std::string trimWhitespace(const std::string& text)
+{
+    std::size_t start = 0;
+    std::size_t end = text.size();
+
+    while (start < end && std::isspace(static_cast<unsigned char>(text[start]))) {
+        ++start;
+    }
+
+    while (end > start && std::isspace(static_cast<unsigned char>(text[end - 1]))) {
+        --end;
+    }
+
+    return text.substr(start, end - start);
+}
+
+/*
+    fileExists
+
+    Comprueba de forma sencilla si un fichero puede abrirse. Se usa para
+    detectar rutas candidatas por defecto del CSV antes de preguntar al usuario.
+*/
+bool fileExists(const std::string& path)
+{
+    std::ifstream file(path.c_str());
+    return file.good();
+}
+
+/*
+    findFirstExistingCandidate
+
+    Recorre la lista de rutas candidatas y devuelve la primera que realmente
+    existe en disco. Si ninguna es valida, devuelve cadena vacia.
+*/
+std::string findFirstExistingCandidate(const std::vector<std::string>& candidatePaths)
+{
+    for (std::size_t i = 0; i < candidatePaths.size(); ++i) {
+        if (!candidatePaths[i].empty() && fileExists(candidatePaths[i])) {
+            return candidatePaths[i];
+        }
+    }
+
+    return "";
+}
+
+/*
+    readTrimmedLine
+
+    Muestra un prompt y lee una linea completa. Despues recorta espacios para
+    que el resto de validaciones trabajen sobre una entrada normalizada.
+*/
+std::string readTrimmedLine(const std::string& prompt)
+{
+    std::cout << prompt;
+
+    std::string input;
+    std::getline(std::cin, input);
+    return trimWhitespace(input);
+}
+
+/*
+    isCancelToken
+
+    Centraliza la interpretacion del caracter de cancelacion. Asi todas las
+    funciones de lectura comparten la misma convencion: escribir X o x vuelve.
+*/
+bool isCancelToken(const std::string& input)
+{
+    return input == "x" || input == "X";
+}
+
+} // namespace
+
+/*
+    printApplicationBanner
+
+    Presenta la aplicacion y deja claro que el estado implementado hoy es la
+    Fase 0, aunque la estructura de la CLI ya prepare las fases restantes.
+*/
+void printApplicationBanner()
+{
+    std::cout << "========================================\n";
+    std::cout << " PL1 CUDA - US Airline Dataset Toolkit\n";
+    std::cout << " Fase 0: lectura, limpieza y preparacion\n";
+    std::cout << "========================================\n";
+}
+
+/*
+    printMainMenu
+
+    Muestra el menu principal de navegacion. Este menu concentra:
+
+    - acceso a las cuatro fases de la practica;
+    - recarga del CSV;
+    - visualizacion del estado actual;
+    - salida limpia de la aplicacion.
+*/
+void printMainMenu()
+{
+    std::cout << "\nMenu principal\n";
+    std::cout << "1. Fase 01 - Retraso en salida\n";
+    std::cout << "2. Fase 02 - Retraso en llegada\n";
+    std::cout << "3. Fase 03 - Reduccion de retraso\n";
+    std::cout << "4. Fase 04 - Histograma de aeropuertos\n";
+    std::cout << "R. Recargar CSV\n";
+    std::cout << "I. Ver estado de la aplicacion\n";
+    std::cout << "X. Salir\n";
+}
+
+// Cabecera del submenu de Fase 01. Sirve para situar al usuario antes de pedir
+// el umbral, aunque la logica CUDA real aun no este conectada.
+void printPhase1Menu()
+{
+    std::cout << "\n=== Fase 01 - Retraso en despegues ===\n";
+    std::cout << "Se trabajara sobre la columna DEP_DELAY.\n";
+    std::cout << "La interfaz ya recoge el umbral firmado.\n";
+}
+
+// Cabecera del submenu de Fase 02. Deja claro que la fase futura combina
+// ARR_DELAY con TAIL_NUM.
+void printPhase2Menu()
+{
+    std::cout << "\n=== Fase 02 - Retraso en aterrizajes ===\n";
+    std::cout << "Se trabajara sobre ARR_DELAY y TAIL_NUM.\n";
+    std::cout << "La interfaz ya recoge el umbral firmado.\n";
+}
+
+// Cabecera del submenu de Fase 03.
+void printPhase3Menu()
+{
+    std::cout << "\n=== Fase 03 - Reduccion de retraso ===\n";
+    std::cout << "Se pedira columna y tipo de reduccion.\n";
+}
+
+// Cabecera del submenu de Fase 04.
+void printPhase4Menu()
+{
+    std::cout << "\n=== Fase 04 - Histograma de aeropuertos ===\n";
+    std::cout << "Se pedira origen/destino y umbral minimo.\n";
+}
+
+/*
+    printPhasePendingMessage
+
+    Mensaje comun utilizado cuando la CLI ya ha capturado parametros validos,
+    pero la fase correspondiente aun no ejecuta su logica CUDA definitiva.
+*/
+void printPhasePendingMessage(const std::string& phaseName)
+{
+    std::cout << "\n[" << phaseName << "] La logica CUDA de esta fase aun no esta implementada.\n";
+    std::cout << "La interfaz ya captura parametros y deja el flujo preparado para las siguientes iteraciones.\n";
+}
+
+/*
+    promptDatasetPath
+
+    Flujo de trabajo:
+
+    1. busca la primera ruta candidata existente;
+    2. la ofrece como valor por defecto si la encuentra;
+    3. permite cancelar con X;
+    4. si el usuario pulsa Intro y existe una ruta valida, la devuelve.
+*/
+std::string promptDatasetPath(const std::vector<std::string>& candidatePaths)
+{
+    const std::string defaultPath = findFirstExistingCandidate(candidatePaths);
+
+    std::cout << "\nIntroduzca la ruta del CSV del dataset.\n";
+    std::cout << "Escriba X para cancelar";
+
+    if (!defaultPath.empty()) {
+        std::cout << " o pulse Intro para usar por defecto:\n";
+        std::cout << defaultPath << "\n";
+    } else {
+        std::cout << ".\n";
+        std::cout << "No se ha encontrado una ruta por defecto valida en el repositorio.\n";
+    }
+
+    const std::string input = readTrimmedLine("Ruta CSV: ");
+
+    if (isCancelToken(input)) {
+        return "";
+    }
+
+    // Si hay ruta por defecto y el usuario pulsa Intro, reutilizamos esa ruta.
+    if (input.empty()) {
+        return defaultPath;
+    }
+
+    return input;
+}
+
+/*
+    readMainMenuOption
+
+    No devuelve control hasta recibir una opcion valida del menu principal.
+    Convierte una cadena del usuario en el enum que usa main para controlar
+    el flujo sin depender de comparaciones de texto dispersas.
+*/
+MainMenuOption readMainMenuOption()
+{
+    while (true) {
+        const std::string input = readTrimmedLine("Seleccione una opcion: ");
+
+        if (input == "1") {
+            return MainMenuOption::Phase1;
+        }
+
+        if (input == "2") {
+            return MainMenuOption::Phase2;
+        }
+
+        if (input == "3") {
+            return MainMenuOption::Phase3;
+        }
+
+        if (input == "4") {
+            return MainMenuOption::Phase4;
+        }
+
+        if (input == "R" || input == "r") {
+            return MainMenuOption::ReloadCsv;
+        }
+
+        if (input == "I" || input == "i") {
+            return MainMenuOption::ShowStatus;
+        }
+
+        if (input == "X" || input == "x") {
+            return MainMenuOption::Exit;
+        }
+
+        std::cout << "Opcion no valida. Intente de nuevo.\n";
+    }
+}
+
+/*
+    readSignedInt
+
+    Lee un entero firmado y comprueba que no queden caracteres residuales tras
+    la conversion. Esto evita aceptar entradas ambiguas como "12abc".
+*/
+bool readSignedInt(const std::string& prompt, int& value)
+{
+    while (true) {
+        const std::string input = readTrimmedLine(prompt);
+
+        if (isCancelToken(input)) {
+            return false;
+        }
+
+        std::stringstream parser(input);
+        int parsedValue = 0;
+        char trailingCharacter = '\0';
+
+        if ((parser >> parsedValue) && !(parser >> trailingCharacter)) {
+            value = parsedValue;
+            return true;
+        }
+
+        std::cout << "Debe introducir un entero valido o X para volver.\n";
+    }
+}
+
+/*
+    readBoundedIntOption
+
+    Igual que readSignedInt, pero ademas exige que el valor este dentro de un
+    rango cerrado. Se usa en submenus donde solo existen opciones numericas
+    concretas y conviene rechazar cualquier valor fuera de rango.
+*/
+bool readBoundedIntOption(const std::string& prompt, int minValue, int maxValue, int& value)
+{
+    while (true) {
+        const std::string input = readTrimmedLine(prompt);
+
+        if (isCancelToken(input)) {
+            return false;
+        }
+
+        std::stringstream parser(input);
+        int parsedValue = 0;
+        char trailingCharacter = '\0';
+
+        if ((parser >> parsedValue) &&
+            !(parser >> trailingCharacter) &&
+            parsedValue >= minValue &&
+            parsedValue <= maxValue) {
+            value = parsedValue;
+            return true;
+        }
+
+        std::cout << "Debe introducir un numero entre " << minValue
+                  << " y " << maxValue
+                  << ", o X para volver.\n";
+    }
+}
+
+/*
+    waitForEnter
+
+    Introduce una pausa sencilla entre pantallas para que el usuario pueda leer
+    mensajes de estado antes de volver al menu principal.
+*/
+void waitForEnter()
+{
+    std::cout << "\nPulse Intro para continuar...";
+
+    std::string dummy;
+    std::getline(std::cin, dummy);
+}
