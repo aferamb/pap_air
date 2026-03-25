@@ -556,24 +556,3 @@ __global__ void phase4MergeHistogramKernel(
 
     finalHistogram[binIndex] = totalCount;
 }
-
-/*
-    phase4GlobalHistogramKernel
-
-    Variante de respaldo cuando el histograma compartido no cabe en memoria
-    compartida. Es mas simple, pero genera mas contencion en memoria global.
-*/
-__global__ void phase4GlobalHistogramKernel(
-    const int* denseIndices,
-    int totalElements,
-    unsigned int* finalHistogram)
-{
-    const int globalIndex = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (globalIndex >= totalElements) {
-        return;
-    }
-
-    const int denseIndex = denseIndices[globalIndex];
-    atomicAdd(&finalHistogram[denseIndex], 1U);
-}

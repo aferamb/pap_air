@@ -165,18 +165,6 @@ void printPhase4Menu()
 }
 
 /*
-    printPhasePendingMessage
-
-    Mensaje comun utilizado cuando la CLI ya ha capturado parametros validos,
-    pero la fase correspondiente aun no ejecuta su logica CUDA definitiva.
-*/
-void printPhasePendingMessage(const std::string& phaseName)
-{
-    std::cout << "\n[" << phaseName << "] La logica CUDA de esta fase aun no esta implementada.\n";
-    std::cout << "La interfaz ya captura parametros y deja el flujo preparado para las siguientes iteraciones.\n";
-}
-
-/*
     promptDatasetPath
 
     Flujo de trabajo:
@@ -260,34 +248,6 @@ MainMenuOption readMainMenuOption()
 }
 
 /*
-    readSignedInt
-
-    Lee un entero firmado y comprueba que no queden caracteres residuales tras
-    la conversion. Esto evita aceptar entradas ambiguas como "12abc".
-*/
-bool readSignedInt(const std::string& prompt, int& value)
-{
-    while (true) {
-        const std::string input = readTrimmedLine(prompt);
-
-        if (isCancelToken(input)) {
-            return false;
-        }
-
-        std::stringstream parser(input);
-        int parsedValue = 0;
-        char trailingCharacter = '\0';
-
-        if ((parser >> parsedValue) && !(parser >> trailingCharacter)) {
-            value = parsedValue;
-            return true;
-        }
-
-        std::cout << "Debe introducir un entero valido o X para volver.\n";
-    }
-}
-
-/*
     readDelayFilterModeOption
 
     Interpreta el modo de filtrado de Fase 01 y Fase 02. La decision de
@@ -330,9 +290,9 @@ bool readDelayFilterModeOption(const std::string& prompt, DelayFilterMode& value
 /*
     readBoundedIntOption
 
-    Igual que readSignedInt, pero ademas exige que el valor este dentro de un
-    rango cerrado. Se usa en submenus donde solo existen opciones numericas
-    concretas y conviene rechazar cualquier valor fuera de rango.
+    Lee un entero y ademas exige que el valor este dentro de un rango cerrado.
+    Se usa en submenus donde solo existen opciones numericas concretas y
+    conviene rechazar cualquier valor fuera de rango.
 */
 bool readBoundedIntOption(const std::string& prompt, int minValue, int maxValue, int& value)
 {

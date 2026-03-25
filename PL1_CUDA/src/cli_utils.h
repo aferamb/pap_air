@@ -62,10 +62,6 @@ void printPhase2Menu();
 void printPhase3Menu();
 void printPhase4Menu();
 
-// Muestra el mensaje estandar utilizado cuando una fase aun no tiene logica
-// CUDA conectada pero la interfaz ya recoge sus parametros.
-void printPhasePendingMessage(const std::string& phaseName);
-
 /*
     promptDatasetPath
 
@@ -77,14 +73,6 @@ std::string promptDatasetPath(const std::vector<std::string>& candidatePaths);
 
 // Lee la opcion del menu principal y no devuelve hasta tener una entrada valida.
 MainMenuOption readMainMenuOption();
-
-/*
-    readSignedInt
-
-    Lee un entero firmado desde consola. Si el usuario escribe X, devuelve
-    false para que el llamador pueda volver al menu anterior sin error.
-*/
-bool readSignedInt(const std::string& prompt, int& value);
 
 /*
     readDelayFilterModeOption

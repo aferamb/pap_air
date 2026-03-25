@@ -2,6 +2,7 @@
 
 #include <climits>
 #include <cmath>
+#include <initializer_list>
 #include <iostream>
 #include <string>
 #include <unordered_map>
@@ -84,6 +85,14 @@ struct AppState {
 };
 
 namespace {
+
+// Variantes atomicas de la Fase 03. Las tres comparten el mismo contrato
+// host: un unico acumulador global y un unico entero de salida.
+enum class Phase3AtomicVariant {
+    Simple,
+    Basic,
+    Intermediate
+};
 
 /*
     appendCandidateIfMissing
@@ -218,6 +227,26 @@ bool reportCudaFailure(cudaError_t status, const char* context)
 }
 
 /*
+    finalizeKernelLaunch
+
+    Todas las fases siguen el mismo patron tras lanzar un kernel:
+
+    1. comprobar si el lanzamiento fue valido;
+    2. sincronizar para esperar su finalizacion.
+
+    Este helper concentra ese patron para no repetir el mismo bloque de dos
+    comprobaciones en cada punto del programa.
+*/
+bool finalizeKernelLaunch(const char* launchContext, const char* syncContext)
+{
+    if (!reportCudaFailure(cudaGetLastError(), launchContext)) {
+        return false;
+    }
+
+    return reportCudaFailure(cudaDeviceSynchronize(), syncContext);
+}
+
+/*
     getDelayFilterModeLabel
 
     Convierte el enum usado en la CLI y en el host a una etiqueta legible para
@@ -272,6 +301,20 @@ void releaseDeviceAllocation(void* devicePointer)
 {
     if (devicePointer != nullptr) {
         cudaFree(devicePointer);
+    }
+}
+
+/*
+    releaseDeviceAllocations
+
+    Variante pequena para liberar varios punteros device seguidos. Se usa para
+    acortar los caminos de error de las fases sin ocultar que se esta
+    liberando realmente.
+*/
+void releaseDeviceAllocations(std::initializer_list<void*> devicePointers)
+{
+    for (void* devicePointer : devicePointers) {
+        releaseDeviceAllocation(devicePointer);
     }
 }
 
@@ -535,12 +578,21 @@ void printPhase3VariantResult(
 }
 
 /*
-    runPhase3SimpleVariant
+    runPhase3AtomicVariant
 
-    Host de la variante 3.1. Inicializa un unico acumulador global, lanza el
-    kernel simple y recupera un entero final con el maximo o minimo buscado.
+    Host comun para las variantes 3.1, 3.2 y 3.3. Las tres comparten la misma
+    idea en host:
+
+    - reservar un unico entero global de salida;
+    - inicializarlo con la identidad de reduccion;
+    - lanzar el kernel correspondiente;
+    - recuperar un unico entero final desde device.
+
+    Lo que cambia entre variantes es el kernel exacto y la memoria compartida
+    que necesita cada una.
 */
-bool runPhase3SimpleVariant(
+bool runPhase3AtomicVariant(
+    Phase3AtomicVariant variant,
     int* deviceInput,
     int totalElements,
     bool isMax,
@@ -550,177 +602,94 @@ bool runPhase3SimpleVariant(
     int* deviceResult = nullptr;
     const int initialValue = getReductionIdentity(isMax);
 
-    if (!reportCudaFailure(cudaMalloc(reinterpret_cast<void**>(&deviceResult), sizeof(int)),
-        "cudaMalloc deviceResult (Fase 03 - Simple)")) {
+    std::size_t sharedBytes = 0;
+    const char* allocationContext = nullptr;
+    const char* copyInContext = nullptr;
+    const char* launchContext = nullptr;
+    const char* syncContext = nullptr;
+    const char* copyOutContext = nullptr;
+
+    switch (variant) {
+    case Phase3AtomicVariant::Simple:
+        allocationContext = "cudaMalloc deviceResult (Fase 03 - Simple)";
+        copyInContext = "cudaMemcpy H2D deviceResult (Fase 03 - Simple)";
+        launchContext = "lanzamiento reductionSimple";
+        syncContext = "cudaDeviceSynchronize Fase 03 - Simple";
+        copyOutContext = "cudaMemcpy D2H deviceResult (Fase 03 - Simple)";
+        break;
+
+    case Phase3AtomicVariant::Basic:
+        sharedBytes = static_cast<std::size_t>(launchConfig.threadsPerBlock + 2) * sizeof(int);
+        allocationContext = "cudaMalloc deviceResult (Fase 03 - Basica)";
+        copyInContext = "cudaMemcpy H2D deviceResult (Fase 03 - Basica)";
+        launchContext = "lanzamiento reductionBasic";
+        syncContext = "cudaDeviceSynchronize Fase 03 - Basica";
+        copyOutContext = "cudaMemcpy D2H deviceResult (Fase 03 - Basica)";
+        break;
+
+    case Phase3AtomicVariant::Intermediate:
+    default:
+        sharedBytes =
+            static_cast<std::size_t>((launchConfig.threadsPerBlock + 2) + launchConfig.threadsPerBlock) * sizeof(int);
+        allocationContext = "cudaMalloc deviceResult (Fase 03 - Intermedia)";
+        copyInContext = "cudaMemcpy H2D deviceResult (Fase 03 - Intermedia)";
+        launchContext = "lanzamiento reductionIntermediate";
+        syncContext = "cudaDeviceSynchronize Fase 03 - Intermedia";
+        copyOutContext = "cudaMemcpy D2H deviceResult (Fase 03 - Intermedia)";
+        break;
+    }
+
+    if (!reportCudaFailure(cudaMalloc(reinterpret_cast<void**>(&deviceResult), sizeof(int)), allocationContext)) {
         return false;
     }
 
-    if (!reportCudaFailure(cudaMemcpy(
-        deviceResult,
-        &initialValue,
-        sizeof(int),
-        cudaMemcpyHostToDevice),
-        "cudaMemcpy H2D deviceResult (Fase 03 - Simple)")) {
-        releaseDeviceAllocation(deviceResult);
+    if (!reportCudaFailure(
+            cudaMemcpy(deviceResult, &initialValue, sizeof(int), cudaMemcpyHostToDevice),
+            copyInContext)) {
+        releaseDeviceAllocations({ deviceResult });
         return false;
     }
 
-    reductionSimple<<<launchConfig.blocks, launchConfig.threadsPerBlock>>>(
-        deviceInput,
-        deviceResult,
-        totalElements,
-        isMax);
+    switch (variant) {
+    case Phase3AtomicVariant::Simple:
+        reductionSimple<<<launchConfig.blocks, launchConfig.threadsPerBlock>>>(
+            deviceInput,
+            deviceResult,
+            totalElements,
+            isMax);
+        break;
 
-    if (!reportCudaFailure(cudaGetLastError(), "lanzamiento reductionSimple")) {
-        releaseDeviceAllocation(deviceResult);
+    case Phase3AtomicVariant::Basic:
+        reductionBasic<<<launchConfig.blocks, launchConfig.threadsPerBlock, sharedBytes>>>(
+            deviceInput,
+            deviceResult,
+            totalElements,
+            isMax);
+        break;
+
+    case Phase3AtomicVariant::Intermediate:
+    default:
+        reductionIntermediate<<<launchConfig.blocks, launchConfig.threadsPerBlock, sharedBytes>>>(
+            deviceInput,
+            deviceResult,
+            totalElements,
+            isMax);
+        break;
+    }
+
+    if (!finalizeKernelLaunch(launchContext, syncContext)) {
+        releaseDeviceAllocations({ deviceResult });
         return false;
     }
 
-    if (!reportCudaFailure(cudaDeviceSynchronize(), "cudaDeviceSynchronize Fase 03 - Simple")) {
-        releaseDeviceAllocation(deviceResult);
+    if (!reportCudaFailure(
+            cudaMemcpy(&outResult, deviceResult, sizeof(int), cudaMemcpyDeviceToHost),
+            copyOutContext)) {
+        releaseDeviceAllocations({ deviceResult });
         return false;
     }
 
-    if (!reportCudaFailure(cudaMemcpy(
-        &outResult,
-        deviceResult,
-        sizeof(int),
-        cudaMemcpyDeviceToHost),
-        "cudaMemcpy D2H deviceResult (Fase 03 - Simple)")) {
-        releaseDeviceAllocation(deviceResult);
-        return false;
-    }
-
-    releaseDeviceAllocation(deviceResult);
-    return true;
-}
-
-/*
-    runPhase3BasicVariant
-
-    Host de la variante 3.2. El resultado sigue siendo un unico acumulador
-    global, pero el kernel usa memoria compartida para consultar anterior,
-    actual y siguiente antes de aplicar la operacion atomica.
-*/
-bool runPhase3BasicVariant(
-    int* deviceInput,
-    int totalElements,
-    bool isMax,
-    const LaunchConfig& launchConfig,
-    int& outResult)
-{
-    int* deviceResult = nullptr;
-    const int initialValue = getReductionIdentity(isMax);
-    const std::size_t sharedBytes =
-        static_cast<std::size_t>(launchConfig.threadsPerBlock + 2) * sizeof(int);
-
-    if (!reportCudaFailure(cudaMalloc(reinterpret_cast<void**>(&deviceResult), sizeof(int)),
-        "cudaMalloc deviceResult (Fase 03 - Basica)")) {
-        return false;
-    }
-
-    if (!reportCudaFailure(cudaMemcpy(
-        deviceResult,
-        &initialValue,
-        sizeof(int),
-        cudaMemcpyHostToDevice),
-        "cudaMemcpy H2D deviceResult (Fase 03 - Basica)")) {
-        releaseDeviceAllocation(deviceResult);
-        return false;
-    }
-
-    reductionBasic<<<launchConfig.blocks, launchConfig.threadsPerBlock, sharedBytes>>>(
-        deviceInput,
-        deviceResult,
-        totalElements,
-        isMax);
-
-    if (!reportCudaFailure(cudaGetLastError(), "lanzamiento reductionBasic")) {
-        releaseDeviceAllocation(deviceResult);
-        return false;
-    }
-
-    if (!reportCudaFailure(cudaDeviceSynchronize(), "cudaDeviceSynchronize Fase 03 - Basica")) {
-        releaseDeviceAllocation(deviceResult);
-        return false;
-    }
-
-    if (!reportCudaFailure(cudaMemcpy(
-        &outResult,
-        deviceResult,
-        sizeof(int),
-        cudaMemcpyDeviceToHost),
-        "cudaMemcpy D2H deviceResult (Fase 03 - Basica)")) {
-        releaseDeviceAllocation(deviceResult);
-        return false;
-    }
-
-    releaseDeviceAllocation(deviceResult);
-    return true;
-}
-
-/*
-    runPhase3IntermediateVariant
-
-    Host de la variante 3.3. El kernel necesita dos zonas compartidas:
-
-    - una para la ventana con halo;
-    - otra para guardar el mejor valor local de cada hilo.
-*/
-bool runPhase3IntermediateVariant(
-    int* deviceInput,
-    int totalElements,
-    bool isMax,
-    const LaunchConfig& launchConfig,
-    int& outResult)
-{
-    int* deviceResult = nullptr;
-    const int initialValue = getReductionIdentity(isMax);
-    const std::size_t sharedBytes =
-        static_cast<std::size_t>((launchConfig.threadsPerBlock + 2) + launchConfig.threadsPerBlock) * sizeof(int);
-
-    if (!reportCudaFailure(cudaMalloc(reinterpret_cast<void**>(&deviceResult), sizeof(int)),
-        "cudaMalloc deviceResult (Fase 03 - Intermedia)")) {
-        return false;
-    }
-
-    if (!reportCudaFailure(cudaMemcpy(
-        deviceResult,
-        &initialValue,
-        sizeof(int),
-        cudaMemcpyHostToDevice),
-        "cudaMemcpy H2D deviceResult (Fase 03 - Intermedia)")) {
-        releaseDeviceAllocation(deviceResult);
-        return false;
-    }
-
-    reductionIntermediate<<<launchConfig.blocks, launchConfig.threadsPerBlock, sharedBytes>>>(
-        deviceInput,
-        deviceResult,
-        totalElements,
-        isMax);
-
-    if (!reportCudaFailure(cudaGetLastError(), "lanzamiento reductionIntermediate")) {
-        releaseDeviceAllocation(deviceResult);
-        return false;
-    }
-
-    if (!reportCudaFailure(cudaDeviceSynchronize(), "cudaDeviceSynchronize Fase 03 - Intermedia")) {
-        releaseDeviceAllocation(deviceResult);
-        return false;
-    }
-
-    if (!reportCudaFailure(cudaMemcpy(
-        &outResult,
-        deviceResult,
-        sizeof(int),
-        cudaMemcpyDeviceToHost),
-        "cudaMemcpy D2H deviceResult (Fase 03 - Intermedia)")) {
-        releaseDeviceAllocation(deviceResult);
-        return false;
-    }
-
-    releaseDeviceAllocation(deviceResult);
+    releaseDeviceAllocations({ deviceResult });
     return true;
 }
 
@@ -755,7 +724,7 @@ bool runPhase3ReductionVariant(
         if (!reportCudaFailure(cudaMalloc(reinterpret_cast<void**>(&devicePartials), partialBytes),
             "cudaMalloc devicePartials (Fase 03 - Reduccion)")) {
             if (ownsCurrentInput) {
-                releaseDeviceAllocation(currentInput);
+                releaseDeviceAllocations({ currentInput });
             }
             return false;
         }
@@ -766,28 +735,18 @@ bool runPhase3ReductionVariant(
             currentCount,
             isMax);
 
-        if (!reportCudaFailure(cudaGetLastError(), "lanzamiento reductionPattern")) {
-            releaseDeviceAllocation(devicePartials);
+        if (!finalizeKernelLaunch("lanzamiento reductionPattern", "cudaDeviceSynchronize Fase 03 - Reduccion")) {
+            releaseDeviceAllocations({ devicePartials });
 
             if (ownsCurrentInput) {
-                releaseDeviceAllocation(currentInput);
-            }
-
-            return false;
-        }
-
-        if (!reportCudaFailure(cudaDeviceSynchronize(), "cudaDeviceSynchronize Fase 03 - Reduccion")) {
-            releaseDeviceAllocation(devicePartials);
-
-            if (ownsCurrentInput) {
-                releaseDeviceAllocation(currentInput);
+                releaseDeviceAllocations({ currentInput });
             }
 
             return false;
         }
 
         if (ownsCurrentInput) {
-            releaseDeviceAllocation(currentInput);
+            releaseDeviceAllocations({ currentInput });
         }
 
         // El vector de parciales pasa a ser la nueva entrada de la siguiente
@@ -809,7 +768,7 @@ bool runPhase3ReductionVariant(
         cudaMemcpyDeviceToHost),
         "cudaMemcpy D2H vector final (Fase 03 - Reduccion)")) {
         if (ownsCurrentInput) {
-            releaseDeviceAllocation(currentInput);
+            releaseDeviceAllocations({ currentInput });
         }
 
         return false;
@@ -824,7 +783,7 @@ bool runPhase3ReductionVariant(
     }
 
     if (ownsCurrentInput) {
-        releaseDeviceAllocation(currentInput);
+        releaseDeviceAllocations({ currentInput });
     }
 
     return true;
@@ -881,7 +840,7 @@ bool runPhase3Computation(
         inputBytes,
         cudaMemcpyHostToDevice),
         "cudaMemcpy H2D deviceInput (Fase 03)")) {
-        releaseDeviceAllocation(deviceInput);
+        releaseDeviceAllocations({ deviceInput });
         return false;
     }
 
@@ -892,27 +851,45 @@ bool runPhase3Computation(
     int intermediateResult = 0;
     int reductionResult = 0;
 
-    if (!runPhase3SimpleVariant(deviceInput, totalElements, isMax, launchConfig, simpleResult)) {
-        releaseDeviceAllocation(deviceInput);
+    if (!runPhase3AtomicVariant(
+            Phase3AtomicVariant::Simple,
+            deviceInput,
+            totalElements,
+            isMax,
+            launchConfig,
+            simpleResult)) {
+        releaseDeviceAllocations({ deviceInput });
         return false;
     }
 
-    if (!runPhase3BasicVariant(deviceInput, totalElements, isMax, launchConfig, basicResult)) {
-        releaseDeviceAllocation(deviceInput);
+    if (!runPhase3AtomicVariant(
+            Phase3AtomicVariant::Basic,
+            deviceInput,
+            totalElements,
+            isMax,
+            launchConfig,
+            basicResult)) {
+        releaseDeviceAllocations({ deviceInput });
         return false;
     }
 
-    if (!runPhase3IntermediateVariant(deviceInput, totalElements, isMax, launchConfig, intermediateResult)) {
-        releaseDeviceAllocation(deviceInput);
+    if (!runPhase3AtomicVariant(
+            Phase3AtomicVariant::Intermediate,
+            deviceInput,
+            totalElements,
+            isMax,
+            launchConfig,
+            intermediateResult)) {
+        releaseDeviceAllocations({ deviceInput });
         return false;
     }
 
     if (!runPhase3ReductionVariant(deviceInput, totalElements, isMax, appState.deviceProp, reductionResult)) {
-        releaseDeviceAllocation(deviceInput);
+        releaseDeviceAllocations({ deviceInput });
         return false;
     }
 
-    releaseDeviceAllocation(deviceInput);
+    releaseDeviceAllocations({ deviceInput });
 
     std::cout << "\nResultados Fase 03:\n";
     printPhase3VariantResult("Simple", columnOption, reductionOption, simpleResult);
@@ -1128,14 +1105,13 @@ bool runPhase4SharedHistogram(
 
     if (!reportCudaFailure(cudaMalloc(reinterpret_cast<void**>(&deviceFinalHistogram), histogramBytes),
         "cudaMalloc deviceFinalHistogram (Fase 04)")) {
-        releaseDeviceAllocation(devicePartialHistograms);
+        releaseDeviceAllocations({ devicePartialHistograms });
         return false;
     }
 
     if (!reportCudaFailure(cudaMemset(deviceFinalHistogram, 0, histogramBytes),
         "cudaMemset deviceFinalHistogram (Fase 04)")) {
-        releaseDeviceAllocation(devicePartialHistograms);
-        releaseDeviceAllocation(deviceFinalHistogram);
+        releaseDeviceAllocations({ devicePartialHistograms, deviceFinalHistogram });
         return false;
     }
 
@@ -1145,15 +1121,10 @@ bool runPhase4SharedHistogram(
         totalBins,
         devicePartialHistograms);
 
-    if (!reportCudaFailure(cudaGetLastError(), "lanzamiento phase4SharedHistogramKernel")) {
-        releaseDeviceAllocation(devicePartialHistograms);
-        releaseDeviceAllocation(deviceFinalHistogram);
-        return false;
-    }
-
-    if (!reportCudaFailure(cudaDeviceSynchronize(), "cudaDeviceSynchronize phase4SharedHistogramKernel")) {
-        releaseDeviceAllocation(devicePartialHistograms);
-        releaseDeviceAllocation(deviceFinalHistogram);
+    if (!finalizeKernelLaunch(
+            "lanzamiento phase4SharedHistogramKernel",
+            "cudaDeviceSynchronize phase4SharedHistogramKernel")) {
+        releaseDeviceAllocations({ devicePartialHistograms, deviceFinalHistogram });
         return false;
     }
 
@@ -1165,15 +1136,10 @@ bool runPhase4SharedHistogram(
         totalBins,
         deviceFinalHistogram);
 
-    if (!reportCudaFailure(cudaGetLastError(), "lanzamiento phase4MergeHistogramKernel")) {
-        releaseDeviceAllocation(devicePartialHistograms);
-        releaseDeviceAllocation(deviceFinalHistogram);
-        return false;
-    }
-
-    if (!reportCudaFailure(cudaDeviceSynchronize(), "cudaDeviceSynchronize phase4MergeHistogramKernel")) {
-        releaseDeviceAllocation(devicePartialHistograms);
-        releaseDeviceAllocation(deviceFinalHistogram);
+    if (!finalizeKernelLaunch(
+            "lanzamiento phase4MergeHistogramKernel",
+            "cudaDeviceSynchronize phase4MergeHistogramKernel")) {
+        releaseDeviceAllocations({ devicePartialHistograms, deviceFinalHistogram });
         return false;
     }
 
@@ -1185,72 +1151,11 @@ bool runPhase4SharedHistogram(
         histogramBytes,
         cudaMemcpyDeviceToHost),
         "cudaMemcpy D2H deviceFinalHistogram (Fase 04)")) {
-        releaseDeviceAllocation(devicePartialHistograms);
-        releaseDeviceAllocation(deviceFinalHistogram);
+        releaseDeviceAllocations({ devicePartialHistograms, deviceFinalHistogram });
         return false;
     }
 
-    releaseDeviceAllocation(devicePartialHistograms);
-    releaseDeviceAllocation(deviceFinalHistogram);
-    return true;
-}
-
-/*
-    runPhase4GlobalHistogram
-
-    Ruta de respaldo cuando el numero de bins no cabe en memoria compartida.
-    Es mas simple: un hilo por fila y atomicAdd directo sobre el histograma
-    global final.
-*/
-bool runPhase4GlobalHistogram(
-    int* deviceDenseInput,
-    int totalElements,
-    int totalBins,
-    const LaunchConfig& launchConfig,
-    std::vector<unsigned int>& outHistogram)
-{
-    unsigned int* deviceFinalHistogram = nullptr;
-    const std::size_t histogramBytes = static_cast<std::size_t>(totalBins) * sizeof(unsigned int);
-
-    if (!reportCudaFailure(cudaMalloc(reinterpret_cast<void**>(&deviceFinalHistogram), histogramBytes),
-        "cudaMalloc deviceFinalHistogram (Fase 04)")) {
-        return false;
-    }
-
-    if (!reportCudaFailure(cudaMemset(deviceFinalHistogram, 0, histogramBytes),
-        "cudaMemset deviceFinalHistogram (Fase 04)")) {
-        releaseDeviceAllocation(deviceFinalHistogram);
-        return false;
-    }
-
-    phase4GlobalHistogramKernel<<<launchConfig.blocks, launchConfig.threadsPerBlock>>>(
-        deviceDenseInput,
-        totalElements,
-        deviceFinalHistogram);
-
-    if (!reportCudaFailure(cudaGetLastError(), "lanzamiento phase4GlobalHistogramKernel")) {
-        releaseDeviceAllocation(deviceFinalHistogram);
-        return false;
-    }
-
-    if (!reportCudaFailure(cudaDeviceSynchronize(), "cudaDeviceSynchronize phase4GlobalHistogramKernel")) {
-        releaseDeviceAllocation(deviceFinalHistogram);
-        return false;
-    }
-
-    outHistogram.assign(static_cast<std::size_t>(totalBins), 0U);
-
-    if (!reportCudaFailure(cudaMemcpy(
-        outHistogram.data(),
-        deviceFinalHistogram,
-        histogramBytes,
-        cudaMemcpyDeviceToHost),
-        "cudaMemcpy D2H deviceFinalHistogram (Fase 04)")) {
-        releaseDeviceAllocation(deviceFinalHistogram);
-        return false;
-    }
-
-    releaseDeviceAllocation(deviceFinalHistogram);
+    releaseDeviceAllocations({ devicePartialHistograms, deviceFinalHistogram });
     return true;
 }
 
@@ -1261,8 +1166,8 @@ bool runPhase4GlobalHistogram(
 
     1. selecciona origen o destino;
     2. construye bins densos en host a partir de SEQ_ID;
-    3. decide si usa memoria compartida o histograma global directo;
-    4. lanza los kernels necesarios;
+    3. comprueba si el histograma cabe en memoria compartida;
+    4. lanza los dos kernels de la ruta principal;
     5. recupera y dibuja el histograma en CPU.
 */
 bool runPhase4Computation(
@@ -1297,19 +1202,19 @@ bool runPhase4Computation(
 
     const LaunchConfig launchConfig = computeLaunchConfig(totalElements, appState.deviceProp);
     const std::size_t sharedHistogramBytes = static_cast<std::size_t>(totalBins) * sizeof(unsigned int);
-    const bool useSharedHistogram =
-        sharedHistogramBytes <= static_cast<std::size_t>(appState.deviceProp.sharedMemPerBlock);
+
+    if (sharedHistogramBytes > static_cast<std::size_t>(appState.deviceProp.sharedMemPerBlock)) {
+        std::cout << "El histograma de la Fase 04 no cabe en la memoria compartida por bloque de esta GPU.\n";
+        std::cout << "Bins necesarios: " << totalBins << "\n";
+        return false;
+    }
 
     std::cout << "- Filas validas para el histograma: " << totalElements << "\n";
     std::cout << "- Aeropuertos unicos por SEQ_ID: " << totalBins << "\n";
     std::cout << "- Configuracion usada: "
               << launchConfig.blocks << " bloques x "
               << launchConfig.threadsPerBlock << " hilos\n";
-    std::cout << "- Estrategia usada: "
-              << (useSharedHistogram
-                  ? "histograma compartido por bloque y fusion global"
-                  : "histograma global directo con atomicas")
-              << "\n";
+    std::cout << "- Estrategia usada: histograma compartido por bloque y fusion global\n";
 
     int* deviceDenseInput = nullptr;
     const std::size_t denseInputBytes = denseInput.size() * sizeof(int);
@@ -1325,31 +1230,20 @@ bool runPhase4Computation(
         denseInputBytes,
         cudaMemcpyHostToDevice),
         "cudaMemcpy H2D deviceDenseInput (Fase 04)")) {
-        releaseDeviceAllocation(deviceDenseInput);
+        releaseDeviceAllocations({ deviceDenseInput });
         return false;
     }
 
     std::vector<unsigned int> histogram;
-    bool histogramBuilt = false;
+    const bool histogramBuilt = runPhase4SharedHistogram(
+        deviceDenseInput,
+        totalElements,
+        totalBins,
+        launchConfig,
+        appState.deviceProp,
+        histogram);
 
-    if (useSharedHistogram) {
-        histogramBuilt = runPhase4SharedHistogram(
-            deviceDenseInput,
-            totalElements,
-            totalBins,
-            launchConfig,
-            appState.deviceProp,
-            histogram);
-    } else {
-        histogramBuilt = runPhase4GlobalHistogram(
-            deviceDenseInput,
-            totalElements,
-            totalBins,
-            launchConfig,
-            histogram);
-    }
-
-    releaseDeviceAllocation(deviceDenseInput);
+    releaseDeviceAllocations({ deviceDenseInput });
 
     if (!histogramBuilt) {
         return false;
@@ -1396,7 +1290,7 @@ bool runPhase1Computation(const AppState& appState, DelayFilterMode mode, int th
 
     if (!reportCudaFailure(cudaMalloc(reinterpret_cast<void**>(&deviceValidMask), validMaskBytes),
         "cudaMalloc deviceValidMask (Fase 01)")) {
-        releaseDeviceAllocation(deviceDelayValues);
+        releaseDeviceAllocations({ deviceDelayValues });
         return false;
     }
 
@@ -1406,8 +1300,7 @@ bool runPhase1Computation(const AppState& appState, DelayFilterMode mode, int th
         delayBufferBytes,
         cudaMemcpyHostToDevice),
         "cudaMemcpy H2D deviceDelayValues (Fase 01)")) {
-        releaseDeviceAllocation(deviceDelayValues);
-        releaseDeviceAllocation(deviceValidMask);
+        releaseDeviceAllocations({ deviceDelayValues, deviceValidMask });
         return false;
     }
 
@@ -1417,8 +1310,7 @@ bool runPhase1Computation(const AppState& appState, DelayFilterMode mode, int th
         validMaskBytes,
         cudaMemcpyHostToDevice),
         "cudaMemcpy H2D deviceValidMask (Fase 01)")) {
-        releaseDeviceAllocation(deviceDelayValues);
-        releaseDeviceAllocation(deviceValidMask);
+        releaseDeviceAllocations({ deviceDelayValues, deviceValidMask });
         return false;
     }
 
@@ -1431,22 +1323,14 @@ bool runPhase1Computation(const AppState& appState, DelayFilterMode mode, int th
         static_cast<int>(mode),
         threshold);
 
-    // Primero comprobamos errores de lanzamiento y despues sincronizamos para
-    // vaciar los printf de GPU antes de volver al menu.
-    if (!reportCudaFailure(cudaGetLastError(), "lanzamiento phase1DepartureDelayKernel")) {
-        releaseDeviceAllocation(deviceDelayValues);
-        releaseDeviceAllocation(deviceValidMask);
+    // Comprobamos el lanzamiento y despues esperamos a que terminen los
+    // printf de GPU antes de volver al menu.
+    if (!finalizeKernelLaunch("lanzamiento phase1DepartureDelayKernel", "cudaDeviceSynchronize Fase 01")) {
+        releaseDeviceAllocations({ deviceDelayValues, deviceValidMask });
         return false;
     }
 
-    if (!reportCudaFailure(cudaDeviceSynchronize(), "cudaDeviceSynchronize Fase 01")) {
-        releaseDeviceAllocation(deviceDelayValues);
-        releaseDeviceAllocation(deviceValidMask);
-        return false;
-    }
-
-    releaseDeviceAllocation(deviceDelayValues);
-    releaseDeviceAllocation(deviceValidMask);
+    releaseDeviceAllocations({ deviceDelayValues, deviceValidMask });
 
     return true;
 }
@@ -1499,41 +1383,36 @@ bool runPhase2Computation(const AppState& appState, DelayFilterMode mode, int th
 
     if (!reportCudaFailure(cudaMalloc(reinterpret_cast<void**>(&deviceValidMask), validMaskBytes),
         "cudaMalloc deviceValidMask (Fase 02)")) {
-        releaseDeviceAllocation(deviceDelayValues);
+        releaseDeviceAllocations({ deviceDelayValues });
         return false;
     }
 
     if (!reportCudaFailure(cudaMalloc(reinterpret_cast<void**>(&deviceTailNumBuffer), tailNumBufferBytes),
         "cudaMalloc deviceTailNumBuffer (Fase 02)")) {
-        releaseDeviceAllocation(deviceDelayValues);
-        releaseDeviceAllocation(deviceValidMask);
+        releaseDeviceAllocations({ deviceDelayValues, deviceValidMask });
         return false;
     }
 
     if (!reportCudaFailure(cudaMalloc(reinterpret_cast<void**>(&deviceOutCount), sizeof(int)),
         "cudaMalloc deviceOutCount (Fase 02)")) {
-        releaseDeviceAllocation(deviceDelayValues);
-        releaseDeviceAllocation(deviceValidMask);
-        releaseDeviceAllocation(deviceTailNumBuffer);
+        releaseDeviceAllocations({ deviceDelayValues, deviceValidMask, deviceTailNumBuffer });
         return false;
     }
 
     if (!reportCudaFailure(cudaMalloc(reinterpret_cast<void**>(&deviceOutDelayValues), delayBufferBytes),
         "cudaMalloc deviceOutDelayValues (Fase 02)")) {
-        releaseDeviceAllocation(deviceDelayValues);
-        releaseDeviceAllocation(deviceValidMask);
-        releaseDeviceAllocation(deviceTailNumBuffer);
-        releaseDeviceAllocation(deviceOutCount);
+        releaseDeviceAllocations({ deviceDelayValues, deviceValidMask, deviceTailNumBuffer, deviceOutCount });
         return false;
     }
 
     if (!reportCudaFailure(cudaMalloc(reinterpret_cast<void**>(&deviceOutTailNumBuffer), tailNumBufferBytes),
         "cudaMalloc deviceOutTailNumBuffer (Fase 02)")) {
-        releaseDeviceAllocation(deviceDelayValues);
-        releaseDeviceAllocation(deviceValidMask);
-        releaseDeviceAllocation(deviceTailNumBuffer);
-        releaseDeviceAllocation(deviceOutCount);
-        releaseDeviceAllocation(deviceOutDelayValues);
+        releaseDeviceAllocations({
+            deviceDelayValues,
+            deviceValidMask,
+            deviceTailNumBuffer,
+            deviceOutCount,
+            deviceOutDelayValues });
         return false;
     }
 
@@ -1543,12 +1422,13 @@ bool runPhase2Computation(const AppState& appState, DelayFilterMode mode, int th
         delayBufferBytes,
         cudaMemcpyHostToDevice),
         "cudaMemcpy H2D deviceDelayValues (Fase 02)")) {
-        releaseDeviceAllocation(deviceDelayValues);
-        releaseDeviceAllocation(deviceValidMask);
-        releaseDeviceAllocation(deviceTailNumBuffer);
-        releaseDeviceAllocation(deviceOutCount);
-        releaseDeviceAllocation(deviceOutDelayValues);
-        releaseDeviceAllocation(deviceOutTailNumBuffer);
+        releaseDeviceAllocations({
+            deviceDelayValues,
+            deviceValidMask,
+            deviceTailNumBuffer,
+            deviceOutCount,
+            deviceOutDelayValues,
+            deviceOutTailNumBuffer });
         return false;
     }
 
@@ -1558,12 +1438,13 @@ bool runPhase2Computation(const AppState& appState, DelayFilterMode mode, int th
         validMaskBytes,
         cudaMemcpyHostToDevice),
         "cudaMemcpy H2D deviceValidMask (Fase 02)")) {
-        releaseDeviceAllocation(deviceDelayValues);
-        releaseDeviceAllocation(deviceValidMask);
-        releaseDeviceAllocation(deviceTailNumBuffer);
-        releaseDeviceAllocation(deviceOutCount);
-        releaseDeviceAllocation(deviceOutDelayValues);
-        releaseDeviceAllocation(deviceOutTailNumBuffer);
+        releaseDeviceAllocations({
+            deviceDelayValues,
+            deviceValidMask,
+            deviceTailNumBuffer,
+            deviceOutCount,
+            deviceOutDelayValues,
+            deviceOutTailNumBuffer });
         return false;
     }
 
@@ -1573,34 +1454,37 @@ bool runPhase2Computation(const AppState& appState, DelayFilterMode mode, int th
         tailNumBufferBytes,
         cudaMemcpyHostToDevice),
         "cudaMemcpy H2D deviceTailNumBuffer (Fase 02)")) {
-        releaseDeviceAllocation(deviceDelayValues);
-        releaseDeviceAllocation(deviceValidMask);
-        releaseDeviceAllocation(deviceTailNumBuffer);
-        releaseDeviceAllocation(deviceOutCount);
-        releaseDeviceAllocation(deviceOutDelayValues);
-        releaseDeviceAllocation(deviceOutTailNumBuffer);
+        releaseDeviceAllocations({
+            deviceDelayValues,
+            deviceValidMask,
+            deviceTailNumBuffer,
+            deviceOutCount,
+            deviceOutDelayValues,
+            deviceOutTailNumBuffer });
         return false;
     }
 
     if (!reportCudaFailure(cudaMemset(deviceOutCount, 0, sizeof(int)),
         "cudaMemset deviceOutCount (Fase 02)")) {
-        releaseDeviceAllocation(deviceDelayValues);
-        releaseDeviceAllocation(deviceValidMask);
-        releaseDeviceAllocation(deviceTailNumBuffer);
-        releaseDeviceAllocation(deviceOutCount);
-        releaseDeviceAllocation(deviceOutDelayValues);
-        releaseDeviceAllocation(deviceOutTailNumBuffer);
+        releaseDeviceAllocations({
+            deviceDelayValues,
+            deviceValidMask,
+            deviceTailNumBuffer,
+            deviceOutCount,
+            deviceOutDelayValues,
+            deviceOutTailNumBuffer });
         return false;
     }
 
     if (!reportCudaFailure(copyPhase2FilterConfigToConstant(static_cast<int>(mode), threshold),
         "copyPhase2FilterConfigToConstant (Fase 02)")) {
-        releaseDeviceAllocation(deviceDelayValues);
-        releaseDeviceAllocation(deviceValidMask);
-        releaseDeviceAllocation(deviceTailNumBuffer);
-        releaseDeviceAllocation(deviceOutCount);
-        releaseDeviceAllocation(deviceOutDelayValues);
-        releaseDeviceAllocation(deviceOutTailNumBuffer);
+        releaseDeviceAllocations({
+            deviceDelayValues,
+            deviceValidMask,
+            deviceTailNumBuffer,
+            deviceOutCount,
+            deviceOutDelayValues,
+            deviceOutTailNumBuffer });
         return false;
     }
 
@@ -1615,23 +1499,14 @@ bool runPhase2Computation(const AppState& appState, DelayFilterMode mode, int th
         deviceOutDelayValues,
         deviceOutTailNumBuffer);
 
-    if (!reportCudaFailure(cudaGetLastError(), "lanzamiento phase2ArrivalDelayKernel")) {
-        releaseDeviceAllocation(deviceDelayValues);
-        releaseDeviceAllocation(deviceValidMask);
-        releaseDeviceAllocation(deviceTailNumBuffer);
-        releaseDeviceAllocation(deviceOutCount);
-        releaseDeviceAllocation(deviceOutDelayValues);
-        releaseDeviceAllocation(deviceOutTailNumBuffer);
-        return false;
-    }
-
-    if (!reportCudaFailure(cudaDeviceSynchronize(), "cudaDeviceSynchronize Fase 02")) {
-        releaseDeviceAllocation(deviceDelayValues);
-        releaseDeviceAllocation(deviceValidMask);
-        releaseDeviceAllocation(deviceTailNumBuffer);
-        releaseDeviceAllocation(deviceOutCount);
-        releaseDeviceAllocation(deviceOutDelayValues);
-        releaseDeviceAllocation(deviceOutTailNumBuffer);
+    if (!finalizeKernelLaunch("lanzamiento phase2ArrivalDelayKernel", "cudaDeviceSynchronize Fase 02")) {
+        releaseDeviceAllocations({
+            deviceDelayValues,
+            deviceValidMask,
+            deviceTailNumBuffer,
+            deviceOutCount,
+            deviceOutDelayValues,
+            deviceOutTailNumBuffer });
         return false;
     }
 
@@ -1643,12 +1518,13 @@ bool runPhase2Computation(const AppState& appState, DelayFilterMode mode, int th
         sizeof(int),
         cudaMemcpyDeviceToHost),
         "cudaMemcpy D2H deviceOutCount (Fase 02)")) {
-        releaseDeviceAllocation(deviceDelayValues);
-        releaseDeviceAllocation(deviceValidMask);
-        releaseDeviceAllocation(deviceTailNumBuffer);
-        releaseDeviceAllocation(deviceOutCount);
-        releaseDeviceAllocation(deviceOutDelayValues);
-        releaseDeviceAllocation(deviceOutTailNumBuffer);
+        releaseDeviceAllocations({
+            deviceDelayValues,
+            deviceValidMask,
+            deviceTailNumBuffer,
+            deviceOutCount,
+            deviceOutDelayValues,
+            deviceOutTailNumBuffer });
         return false;
     }
 
@@ -1663,12 +1539,13 @@ bool runPhase2Computation(const AppState& appState, DelayFilterMode mode, int th
             static_cast<std::size_t>(resultCount) * sizeof(int),
             cudaMemcpyDeviceToHost),
             "cudaMemcpy D2H deviceOutDelayValues (Fase 02)")) {
-            releaseDeviceAllocation(deviceDelayValues);
-            releaseDeviceAllocation(deviceValidMask);
-            releaseDeviceAllocation(deviceTailNumBuffer);
-            releaseDeviceAllocation(deviceOutCount);
-            releaseDeviceAllocation(deviceOutDelayValues);
-            releaseDeviceAllocation(deviceOutTailNumBuffer);
+            releaseDeviceAllocations({
+                deviceDelayValues,
+                deviceValidMask,
+                deviceTailNumBuffer,
+                deviceOutCount,
+                deviceOutDelayValues,
+                deviceOutTailNumBuffer });
             return false;
         }
 
@@ -1678,22 +1555,24 @@ bool runPhase2Computation(const AppState& appState, DelayFilterMode mode, int th
             static_cast<std::size_t>(resultCount) * kPhase2TailNumStride * sizeof(char),
             cudaMemcpyDeviceToHost),
             "cudaMemcpy D2H deviceOutTailNumBuffer (Fase 02)")) {
-            releaseDeviceAllocation(deviceDelayValues);
-            releaseDeviceAllocation(deviceValidMask);
-            releaseDeviceAllocation(deviceTailNumBuffer);
-            releaseDeviceAllocation(deviceOutCount);
-            releaseDeviceAllocation(deviceOutDelayValues);
-            releaseDeviceAllocation(deviceOutTailNumBuffer);
+            releaseDeviceAllocations({
+                deviceDelayValues,
+                deviceValidMask,
+                deviceTailNumBuffer,
+                deviceOutCount,
+                deviceOutDelayValues,
+                deviceOutTailNumBuffer });
             return false;
         }
     }
 
-    releaseDeviceAllocation(deviceDelayValues);
-    releaseDeviceAllocation(deviceValidMask);
-    releaseDeviceAllocation(deviceTailNumBuffer);
-    releaseDeviceAllocation(deviceOutCount);
-    releaseDeviceAllocation(deviceOutDelayValues);
-    releaseDeviceAllocation(deviceOutTailNumBuffer);
+    releaseDeviceAllocations({
+        deviceDelayValues,
+        deviceValidMask,
+        deviceTailNumBuffer,
+        deviceOutCount,
+        deviceOutDelayValues,
+        deviceOutTailNumBuffer });
 
     printPhase2HostSummary(mode, threshold, resultCount, outDelayValues, outTailNumBuffer);
     return true;
@@ -1884,6 +1763,33 @@ void printSuggestedLaunchConfigIfAvailable(const AppState& appState)
 }
 
 /*
+    canRunGpuPhase
+
+    Las cuatro fases CUDA comparten dos precondiciones minimas:
+
+    - el dataset debe estar cargado;
+    - la GPU CUDA debe estar disponible.
+
+    Este helper unifica ese mensaje de rechazo para que los shells no repitan
+    siempre el mismo bloque de comprobacion.
+*/
+bool canRunGpuPhase(const AppState& appState, const char* phaseLabel)
+{
+    if (!appState.datasetLoaded) {
+        std::cout << "No hay dataset cargado. Cargue un CSV antes de continuar.\n";
+        return false;
+    }
+
+    if (!appState.deviceReady) {
+        std::cout << "No hay GPU CUDA disponible para ejecutar la " << phaseLabel << ".\n";
+        std::cout << "Motivo: " << appState.deviceErrorMessage << "\n";
+        return false;
+    }
+
+    return true;
+}
+
+/*
     runPhase1Shell
 
     Submenu real de la Fase 01. Esta funcion:
@@ -1897,15 +1803,7 @@ void runPhase1Shell(const AppState& appState)
 {
     printPhase1Menu();
 
-    if (!appState.datasetLoaded) {
-        std::cout << "No hay dataset cargado. Cargue un CSV antes de continuar.\n";
-        waitForEnter();
-        return;
-    }
-
-    if (!appState.deviceReady) {
-        std::cout << "No hay GPU CUDA disponible para ejecutar la Fase 01.\n";
-        std::cout << "Motivo: " << appState.deviceErrorMessage << "\n";
+    if (!canRunGpuPhase(appState, "Fase 01")) {
         waitForEnter();
         return;
     }
@@ -1945,15 +1843,7 @@ void runPhase2Shell(const AppState& appState)
 {
     printPhase2Menu();
 
-    if (!appState.datasetLoaded) {
-        std::cout << "No hay dataset cargado. Cargue un CSV antes de continuar.\n";
-        waitForEnter();
-        return;
-    }
-
-    if (!appState.deviceReady) {
-        std::cout << "No hay GPU CUDA disponible para ejecutar la Fase 02.\n";
-        std::cout << "Motivo: " << appState.deviceErrorMessage << "\n";
+    if (!canRunGpuPhase(appState, "Fase 02")) {
         waitForEnter();
         return;
     }
@@ -1997,15 +1887,7 @@ void runPhase3Shell(const AppState& appState)
 {
     printPhase3Menu();
 
-    if (!appState.datasetLoaded) {
-        std::cout << "No hay dataset cargado. Cargue un CSV antes de continuar.\n";
-        waitForEnter();
-        return;
-    }
-
-    if (!appState.deviceReady) {
-        std::cout << "No hay GPU CUDA disponible para ejecutar la Fase 03.\n";
-        std::cout << "Motivo: " << appState.deviceErrorMessage << "\n";
+    if (!canRunGpuPhase(appState, "Fase 03")) {
         waitForEnter();
         return;
     }
@@ -2056,15 +1938,7 @@ void runPhase4Shell(const AppState& appState)
 {
     printPhase4Menu();
 
-    if (!appState.datasetLoaded) {
-        std::cout << "No hay dataset cargado. Cargue un CSV antes de continuar.\n";
-        waitForEnter();
-        return;
-    }
-
-    if (!appState.deviceReady) {
-        std::cout << "No hay GPU CUDA disponible para ejecutar la Fase 04.\n";
-        std::cout << "Motivo: " << appState.deviceErrorMessage << "\n";
+    if (!canRunGpuPhase(appState, "Fase 04")) {
         waitForEnter();
         return;
     }

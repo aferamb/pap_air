@@ -261,8 +261,6 @@ Separar del `main` todo lo relacionado con:
     defecto.
 - `readMainMenuOption()`
   - convierte la entrada del usuario en un `MainMenuOption`.
-- `readSignedInt(...)`
-  - valida enteros firmados para umbrales.
 - `readDelayFilterModeOption(...)`
   - pide `retraso`, `adelanto` o `ambos`;
   - si el usuario pulsa Intro, selecciona `ambos`.
@@ -441,7 +439,6 @@ __global__ void reductionPattern(...);
 __global__ void reductionSimple(int* data, int* result, int n, bool isMax);
 __global__ void phase4SharedHistogramKernel(...);
 __global__ void phase4MergeHistogramKernel(...);
-__global__ void phase4GlobalHistogramKernel(...);
 ```
 
 ### Que hace cada kernel
@@ -472,8 +469,6 @@ __global__ void phase4GlobalHistogramKernel(...);
   - construye un histograma parcial por bloque en memoria compartida.
 - `phase4MergeHistogramKernel`
   - fusiona los parciales del histograma compartido.
-- `phase4GlobalHistogramKernel`
-  - sirve de respaldo si el numero de bins no cabe en memoria compartida.
 
 ---
 
@@ -512,8 +507,8 @@ __global__ void phase4GlobalHistogramKernel(...);
   - variante 3.4 con patron de reduccion por bloques y cierre final en CPU.
 - Fase 04
   - histograma por aeropuerto basado en `SEQ_ID` densos;
-  - uso de memoria compartida por bloque cuando el numero de bins cabe;
-  - respaldo global directo con atomicas si no cabe.
+  - uso de memoria compartida por bloque y fusion global;
+  - si los bins no caben en compartida, la fase se cancela con un mensaje claro.
 
 ### Punto importante del estado actual
 

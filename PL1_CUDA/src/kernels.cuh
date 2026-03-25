@@ -181,14 +181,3 @@ __global__ void phase4MergeHistogramKernel(
     int partialCount,
     int totalBins,
     unsigned int* finalHistogram);
-
-/*
-    phase4GlobalHistogramKernel
-
-    Ruta de respaldo simple para la Fase 04. Cada hilo procesa una fila valida
-    y aplica atomicAdd directamente sobre el histograma global final.
-*/
-__global__ void phase4GlobalHistogramKernel(
-    const int* denseIndices,
-    int totalElements,
-    unsigned int* finalHistogram);
