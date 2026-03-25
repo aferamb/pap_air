@@ -12,7 +12,7 @@
     - Fase 01: deteccion de retrasos o adelantos en despegues sobre DEP_DELAY;
     - Fase 02: deteccion de retrasos o adelantos en aterrizajes sobre
       ARR_DELAY + TAIL_NUM usando memoria constante y atomicas;
-    - Fase 03.1: reduccion simple conservada como referencia previa.
+    - Fase 03: las cuatro variantes de reduccion pedidas en el enunciado.
 
     La idea es que main.cu pueda incluir este archivo y disponer de las
     declaraciones necesarias sin mezclar la implementacion CUDA dentro del
@@ -87,6 +87,17 @@ __global__ void phase2ArrivalDelayKernel(
     char* outTailNumBuffer);
 
 /*
+    deviceCompareReduction
+
+    Helper device muy pequeno para comparar dos enteros sin depender de
+    funciones max()/min() externas. Devuelve:
+
+    - el mayor, si isMax es true;
+    - el menor, si isMax es false.
+*/
+__device__ int deviceCompareReduction(int left, int right, bool isMax);
+
+/*
     reductionSimple
 
     Kernel de reduccion simple asociado a la variante 3.1 de la Fase 03.
@@ -109,3 +120,34 @@ __global__ void phase2ArrivalDelayKernel(
     los hilos compiten por la misma posicion de memoria global.
 */
 __global__ void reductionSimple(int* data, int* result, int n, bool isMax);
+
+/*
+    reductionBasic
+
+    Variante 3.2 de la Fase 03. Cada hilo:
+
+    - consulta anterior, actual y siguiente;
+    - usa memoria compartida para esas lecturas vecinas;
+    - publica el mejor de las tres posiciones en un acumulador global atomico.
+*/
+__global__ void reductionBasic(const int* data, int* result, int n, bool isMax);
+
+/*
+    reductionIntermediate
+
+    Variante 3.3 de la Fase 03. Cada hilo calcula primero, en memoria
+    compartida, el mejor valor de su ventana de tres posiciones. Despues, los
+    hilos con indice global par comparan su valor local con el siguiente y
+    publican el mejor mediante una operacion atomica global.
+*/
+__global__ void reductionIntermediate(const int* data, int* result, int n, bool isMax);
+
+/*
+    reductionPattern
+
+    Variante 3.4 de la Fase 03. Aplica un patron clasico de reduccion por
+    bloque usando memoria compartida y genera un vector de resultados
+    parciales. El host debera relanzar este kernel tantas veces como haga
+    falta hasta dejar 10 elementos o menos.
+*/
+__global__ void reductionPattern(const int* input, int* output, int n, bool isMax);

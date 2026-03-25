@@ -23,15 +23,14 @@ enum class MainMenuOption {
     Exit
 };
 
-// Columnas que el usuario podra elegir cuando se implemente la Fase 03.
-// Aunque la fase aun no se ejecuta, la CLI ya deja la interfaz preparada.
+// Columnas que el usuario puede elegir en la Fase 03 ya implementada.
 enum class Phase3ColumnOption {
     DepartureDelay = 1,
     ArrivalDelay = 2,
     WeatherDelay = 3
 };
 
-// Tipo de reduccion que se solicitara en la Fase 03.
+// Tipo de reduccion que la Fase 03 aplica sobre la columna elegida.
 enum class ReductionTypeOption {
     Maximum = 1,
     Minimum = 2

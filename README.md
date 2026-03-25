@@ -4,7 +4,8 @@
 
 Este repositorio contiene una practica academica de **CUDA C/C++** basada en el
 **US Airline Dataset**. En el estado actual del codigo, las partes realmente
-implementadas son la **Fase 0**, la **Fase 01** y la **Fase 02**:
+implementadas son la **Fase 0**, la **Fase 01**, la **Fase 02** y la
+**Fase 03**:
 
 - lectura del CSV desde disco;
 - limpieza basica y validacion de cabecera;
@@ -13,9 +14,11 @@ implementadas son la **Fase 0**, la **Fase 01** y la **Fase 02**:
 - deteccion del hardware CUDA disponible;
 - interfaz de consola completa y navegable para las Fases 1-4;
 - filtrado CUDA de `DEP_DELAY` para la Fase 01;
-- filtrado CUDA de `ARR_DELAY` + `TAIL_NUM` para la Fase 02.
+- filtrado CUDA de `ARR_DELAY` + `TAIL_NUM` para la Fase 02;
+- reducciones CUDA de maximo/minimo sobre `DEP_DELAY`, `ARR_DELAY` y
+  `WEATHER_DELAY` para la Fase 03.
 
-Las **Fases 03 y 04** siguen teniendo solo el flujo de menu preparado.
+La **Fase 04** sigue teniendo solo el flujo de menu preparado.
 
 ---
 
@@ -41,7 +44,7 @@ El proyecto principal es `PL1_CUDA` y los archivos mas importantes son:
 - `PL1_CUDA/src/cli_utils.cpp`
   - implementa menus, lectura segura de opciones y pausas entre pantallas.
 - `PL1_CUDA/src/kernels.cuh`
-  - declara los kernels de Fase 01, Fase 02 y `reductionSimple`.
+  - declara los kernels de Fase 01, Fase 02 y Fase 03.
 - `PL1_CUDA/src/kernels.cu`
   - implementa los kernels CUDA actuales del proyecto.
 - `PL1_CUDA/cuda.local.props.example`
@@ -117,15 +120,17 @@ Cuando se ejecuta el programa, el flujo actual es este:
    fases, recarga del CSV, estado y salida.
 10. Si el usuario entra en Fase 01 o Fase 02, la aplicacion prepara buffers en
     host, lanza el kernel y muestra los resultados.
-11. Si el usuario entra en Fase 03 o Fase 04, la CLI sigue recogiendo los
-    parametros, pero esas fases aun estan pendientes.
+11. Si el usuario entra en Fase 03, la aplicacion compacta la columna elegida,
+    la copia a GPU y ejecuta las cuatro variantes de reduccion.
+12. Si el usuario entra en Fase 04, la CLI sigue recogiendo los parametros,
+    pero esa fase aun esta pendiente.
 
 En otras palabras:
 
 - la **CPU** gestiona lectura, limpieza, validacion, estado, menus y
   preparacion de buffers;
-- la **GPU** ya ejecuta los kernels de Fase 01 y Fase 02;
-- el kernel de reduccion sigue existiendo como base futura de la Fase 03.
+- la **GPU** ya ejecuta los kernels de Fase 01, Fase 02 y Fase 03;
+- la Fase 04 sigue siendo la unica fase obligatoria aun no conectada.
 
 ---
 
@@ -285,7 +290,7 @@ Comportamiento actual de los submenus:
   - ejecuta el kernel de filtrado sobre `ARR_DELAY` y devuelve resultados al
     host.
 - Fase 03
-  - sigue pendiente.
+  - ejecuta las cuatro variantes obligatorias de reduccion.
 - Fase 04
   - sigue pendiente.
 
@@ -331,12 +336,17 @@ Comportamiento actual de los submenus:
 - `printSuggestedLaunchConfigIfAvailable(...)`
   - muestra una configuracion futura de lanzamiento para el dataset cargado.
 - `runPhase1Shell(...)`
-  - pide umbral y ejecuta la Fase 01.
+  - pide tipo de filtro y umbral;
+  - ejecuta la Fase 01.
 - `runPhase2Shell(...)`
-  - pide umbral y ejecuta la Fase 02.
+  - pide tipo de filtro y umbral;
+  - ejecuta la Fase 02.
 - `runPhase3Shell(...)`
+  - pide columna y tipo de reduccion;
+  - compacta la columna elegida;
+  - ejecuta las cuatro variantes de Fase 03.
 - `runPhase4Shell(...)`
-  - siguen siendo los submenus actuales de las fases futuras.
+  - sigue siendo el submenu actual de la fase futura.
 
 ### Flujo de llamadas real
 
@@ -399,8 +409,8 @@ flowchart TD
 - Cuando la carga termina bien, el resultado queda guardado en
   `appState.loadResult`, de forma que el menu y las fases futuras reutilizan el
   dataset sin volver a leer el CSV.
-- Las Fases 01 y 02 preparan sus buffers desde `appState.loadResult.dataset` y
-  lanzan sus kernels sin recargar el fichero.
+- Las Fases 01, 02 y 03 preparan sus buffers desde
+  `appState.loadResult.dataset` y lanzan sus kernels sin recargar el fichero.
 
 ---
 
@@ -411,6 +421,9 @@ El archivo `kernels.cu` mantiene estos kernels:
 ```cpp
 __global__ void phase1DepartureDelayKernel(...);
 __global__ void phase2ArrivalDelayKernel(...);
+__global__ void reductionBasic(...);
+__global__ void reductionIntermediate(...);
+__global__ void reductionPattern(...);
 __global__ void reductionSimple(int* data, int* result, int n, bool isMax);
 ```
 
@@ -428,9 +441,16 @@ __global__ void reductionSimple(int* data, int* result, int n, bool isMax);
   - guarda retraso y matricula en arrays simples;
   - imprime hilo global, matricula y tipo detectado.
 - `reductionSimple`
-  - se conserva como base de la variante 3.1 de la Fase 03.
-
-`reductionSimple` no se lanza todavia desde `main.cu`.
+  - implementa la variante 3.1 simple.
+- `reductionBasic`
+  - implementa la variante 3.2 basica con ventana anterior-actual-siguiente
+    en memoria compartida.
+- `reductionIntermediate`
+  - implementa la variante 3.3 intermedia con mejor valor local en memoria
+    compartida y publicacion por parejas desde hilos pares.
+- `reductionPattern`
+  - implementa la variante 3.4 de patron de reduccion por bloques y genera
+    vectores parciales para reducciones sucesivas.
 
 ---
 
@@ -448,6 +468,7 @@ __global__ void reductionSimple(int* data, int* result, int n, bool isMax);
 - captura de parametros del usuario;
 - consulta del hardware CUDA;
 - truncado de columnas a enteros para Fase 01 y Fase 02;
+- compactado de columnas validas para Fase 03;
 - linealizacion de `TAIL_NUM` para Fase 02;
 - copia de resultados de Fase 02 desde device a host.
 
@@ -459,11 +480,14 @@ __global__ void reductionSimple(int* data, int* result, int n, bool isMax);
   - filtrado de `ARR_DELAY` segun tipo de filtro y umbral absoluto;
   - uso de memoria constante para modo y umbral;
   - uso de atomicas para contar y reservar salidas.
+- Fase 03
+  - variante 3.1 simple con una atómica global por hilo;
+  - variante 3.2 basica con memoria compartida y ventana de tres posiciones;
+  - variante 3.3 intermedia con memoria compartida y publicacion por parejas;
+  - variante 3.4 con patron de reduccion por bloques y cierre final en CPU.
 
 ### Futuro previsto segun la estructura actual
 
-- Fase 03
-  - reducciones de maximo/minimo sobre columnas de retraso.
 - Fase 04
   - histograma por aeropuerto, previsiblemente basado en `SEQ_ID`.
 
@@ -477,8 +501,8 @@ Si hay que explicar el codigo hoy, la idea clave es esta:
 - ya tiene una **CLI completa** para el flujo de la practica;
 - ya tiene un **estado global coherente** en `AppState`;
 - ya conoce el **hardware CUDA disponible**;
-- ya ejecuta de forma real las **Fases 01 y 02**;
-- y deja pendientes solo las **Fases 03 y 04**.
+- ya ejecuta de forma real las **Fases 01, 02 y 03**;
+- y deja pendiente solo la **Fase 04**.
 
 La defensa actual debe centrarse en:
 
@@ -488,7 +512,9 @@ La defensa actual debe centrarse en:
 - por que la CLI esta separada en `cli_utils`;
 - por que se consulta el hardware antes de fijar una configuracion de lanzamiento;
 - por que Fase 02 usa memoria constante y atomicas;
-- y por que Fase 03 aun no forma parte del flujo principal.
+- por que Fase 03 compacta los datos validos antes de reducir;
+- y por que la variante 3.4 termina en CPU solo cuando quedan 10 valores o
+  menos.
 
 ---
 
@@ -496,7 +522,7 @@ La defensa actual debe centrarse en:
 
 En el estado actual del proyecto:
 
-- las Fases 03 y 04 aun no ejecutan su computo CUDA real;
+- la Fase 04 aun no ejecuta su computo CUDA real;
 - el build depende de que cada maquina tenga `CUDA_PATH` bien definido o, en su
   defecto, un `cuda.local.props` correcto;
 - el parser CSV es sencillo y deliberadamente limitado al dataset de la practica;
@@ -509,9 +535,10 @@ En el estado actual del proyecto:
 
 ## Siguiente paso natural
 
-El siguiente paso tecnico coherente es implementar la **Fase 03** sobre esta
+El siguiente paso tecnico coherente es implementar la **Fase 04** sobre esta
 base ya preparada:
 
-- reutilizando el mismo esquema de buffers simples y lanzamiento por hardware;
+- reutilizando el mismo esquema de menu y lanzamiento por hardware;
 - manteniendo el acceso linealizado 1D;
-- y conservando el estilo sencillo y muy comentado de las Fases 01 y 02.
+- y usando `ORIGIN_SEQ_ID` o `DEST_SEQ_ID` como apoyo para evitar trabajar con
+  strings directos en GPU.

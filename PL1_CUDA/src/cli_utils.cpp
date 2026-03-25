@@ -97,14 +97,15 @@ bool isCancelToken(const std::string& input)
 /*
     printApplicationBanner
 
-    Presenta la aplicacion y deja claro que el estado implementado hoy es la
-    Fase 0, aunque la estructura de la CLI ya prepare las fases restantes.
+    Presenta la aplicacion y resume el alcance actual del proyecto para que el
+    usuario vea desde el arranque que ya existen fases CUDA conectadas ademas
+    de la carga inicial del CSV.
 */
 void printApplicationBanner()
 {
     std::cout << "========================================\n";
     std::cout << " PL1 CUDA - US Airline Dataset Toolkit\n";
-    std::cout << " Fase 0: lectura, limpieza y preparacion\n";
+    std::cout << " Fases 0-3: carga y kernels principales\n";
     std::cout << "========================================\n";
 }
 

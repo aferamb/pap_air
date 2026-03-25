@@ -87,6 +87,57 @@ __device__ const char* detectDeviceArrivalLabel(int value, int mode, int thresho
 }
 
 /*
+    deviceCompareReduction
+
+    Comparador minimo comun para las cuatro variantes de la Fase 03. Se deja
+    en device para poder reutilizar la misma logica dentro de varios kernels
+    sin depender de funciones auxiliares de otras librerias.
+*/
+__device__ int deviceCompareReduction(int left, int right, bool isMax)
+{
+    if (isMax) {
+        return left > right ? left : right;
+    }
+
+    return left < right ? left : right;
+}
+
+/*
+    computeWindowReductionFromGlobal
+
+    Helper interno usado por la variante intermedia cuando el segundo elemento
+    de la pareja cae en otro bloque. Calcula, leyendo memoria global, el mejor
+    valor entre:
+
+    - la posicion anterior;
+    - la posicion actual;
+    - la posicion posterior.
+
+    Si alguna posicion no existe, se sustituye por la identidad de la
+    reduccion para no contaminar el resultado.
+*/
+__device__ int computeWindowReductionFromGlobal(const int* data, int n, int idx, bool isMax)
+{
+    const int identity = isMax ? INT_MIN : INT_MAX;
+
+    int bestValue = data[idx];
+
+    if (idx > 0) {
+        bestValue = deviceCompareReduction(bestValue, data[idx - 1], isMax);
+    } else {
+        bestValue = deviceCompareReduction(bestValue, identity, isMax);
+    }
+
+    if (idx + 1 < n) {
+        bestValue = deviceCompareReduction(bestValue, data[idx + 1], isMax);
+    } else {
+        bestValue = deviceCompareReduction(bestValue, identity, isMax);
+    }
+
+    return bestValue;
+}
+
+/*
     copyPhase2FilterConfigToConstant
 
     Copia desde host a memoria constante la configuracion que necesita la Fase
@@ -235,5 +286,204 @@ __global__ void reductionSimple(int* data, int* result, int n, bool isMax)
         atomicMax(result, value);
     } else {
         atomicMin(result, value);
+    }
+}
+
+/*
+    reductionBasic
+
+    Variante 3.2. Cada hilo trabaja con una ventana de tres posiciones:
+
+    - anterior;
+    - actual;
+    - siguiente.
+
+    La informacion vecina se apoya en memoria compartida para que el acceso
+    quede claramente visible y separado de la memoria global.
+*/
+__global__ void reductionBasic(const int* data, int* result, int n, bool isMax)
+{
+    extern __shared__ int sharedWindow[];
+
+    const int globalIndex = blockIdx.x * blockDim.x + threadIdx.x;
+    const int localIndex = threadIdx.x;
+    const int blockStart = blockIdx.x * blockDim.x;
+    const int identity = isMax ? INT_MIN : INT_MAX;
+
+    int validElementsInBlock = n - blockStart;
+
+    if (validElementsInBlock < 0) {
+        validElementsInBlock = 0;
+    }
+
+    if (validElementsInBlock > blockDim.x) {
+        validElementsInBlock = blockDim.x;
+    }
+
+    // Cada hilo deja su valor en la zona central de la ventana compartida.
+    if (globalIndex < n) {
+        sharedWindow[localIndex + 1] = data[globalIndex];
+    } else {
+        sharedWindow[localIndex + 1] = identity;
+    }
+
+    // Un unico hilo carga los halos de izquierda y derecha del bloque.
+    if (localIndex == 0) {
+        sharedWindow[0] = blockStart > 0 ? data[blockStart - 1] : identity;
+
+        if (validElementsInBlock > 0) {
+            const int nextIndex = blockStart + validElementsInBlock;
+            sharedWindow[validElementsInBlock + 1] = nextIndex < n ? data[nextIndex] : identity;
+        } else {
+            sharedWindow[1] = identity;
+        }
+    }
+
+    __syncthreads();
+
+    if (globalIndex >= n) {
+        return;
+    }
+
+    const int previousValue = sharedWindow[localIndex];
+    const int currentValue = sharedWindow[localIndex + 1];
+    const int nextValue = sharedWindow[localIndex + 2];
+
+    int bestValue = deviceCompareReduction(previousValue, currentValue, isMax);
+    bestValue = deviceCompareReduction(bestValue, nextValue, isMax);
+
+    if (isMax) {
+        atomicMax(result, bestValue);
+    } else {
+        atomicMin(result, bestValue);
+    }
+}
+
+/*
+    reductionIntermediate
+
+    Variante 3.3. La primera parte es igual que la basica: cada hilo consulta
+    una ventana de tres posiciones usando memoria compartida. La diferencia es
+    que el mejor valor local se guarda en una segunda zona compartida y solo
+    los hilos con indice global par publican por parejas hacia memoria global.
+*/
+__global__ void reductionIntermediate(const int* data, int* result, int n, bool isMax)
+{
+    extern __shared__ int sharedMemory[];
+
+    // Repartimos la memoria compartida en dos zonas contiguas:
+    // una para la ventana con halo y otra para el mejor valor local.
+    int* sharedWindow = sharedMemory;
+    int* sharedLocalBest = sharedMemory + blockDim.x + 2;
+
+    const int globalIndex = blockIdx.x * blockDim.x + threadIdx.x;
+    const int localIndex = threadIdx.x;
+    const int blockStart = blockIdx.x * blockDim.x;
+    const int identity = isMax ? INT_MIN : INT_MAX;
+
+    int validElementsInBlock = n - blockStart;
+
+    if (validElementsInBlock < 0) {
+        validElementsInBlock = 0;
+    }
+
+    if (validElementsInBlock > blockDim.x) {
+        validElementsInBlock = blockDim.x;
+    }
+
+    if (globalIndex < n) {
+        sharedWindow[localIndex + 1] = data[globalIndex];
+    } else {
+        sharedWindow[localIndex + 1] = identity;
+    }
+
+    if (localIndex == 0) {
+        sharedWindow[0] = blockStart > 0 ? data[blockStart - 1] : identity;
+
+        if (validElementsInBlock > 0) {
+            const int nextIndex = blockStart + validElementsInBlock;
+            sharedWindow[validElementsInBlock + 1] = nextIndex < n ? data[nextIndex] : identity;
+        } else {
+            sharedWindow[1] = identity;
+        }
+    }
+
+    __syncthreads();
+
+    if (globalIndex < n) {
+        int bestValue = deviceCompareReduction(sharedWindow[localIndex], sharedWindow[localIndex + 1], isMax);
+        bestValue = deviceCompareReduction(bestValue, sharedWindow[localIndex + 2], isMax);
+        sharedLocalBest[localIndex] = bestValue;
+    } else {
+        sharedLocalBest[localIndex] = identity;
+    }
+
+    __syncthreads();
+
+    if (globalIndex >= n) {
+        return;
+    }
+
+    if ((globalIndex % 2) != 0) {
+        return;
+    }
+
+    int pairBest = sharedLocalBest[localIndex];
+    const int nextGlobalIndex = globalIndex + 1;
+
+    if (nextGlobalIndex < n) {
+        // Si el siguiente hilo esta dentro del mismo bloque, reutilizamos la
+        // memoria compartida. Si no, recalculamos su ventana desde memoria
+        // global para no perder la pareja que cruza el limite del bloque.
+        if (localIndex + 1 < validElementsInBlock) {
+            pairBest = deviceCompareReduction(pairBest, sharedLocalBest[localIndex + 1], isMax);
+        } else {
+            const int nextBest = computeWindowReductionFromGlobal(data, n, nextGlobalIndex, isMax);
+            pairBest = deviceCompareReduction(pairBest, nextBest, isMax);
+        }
+    }
+
+    if (isMax) {
+        atomicMax(result, pairBest);
+    } else {
+        atomicMin(result, pairBest);
+    }
+}
+
+/*
+    reductionPattern
+
+    Variante 3.4. Cada bloque reduce su tramo del vector a un unico parcial.
+    El host relanzara el mismo patron sobre el vector de parciales hasta dejar
+    10 elementos o menos, momento en el que cerrara el resultado en CPU.
+*/
+__global__ void reductionPattern(const int* input, int* output, int n, bool isMax)
+{
+    extern __shared__ int sharedReduction[];
+
+    const int globalIndex = blockIdx.x * blockDim.x + threadIdx.x;
+    const int localIndex = threadIdx.x;
+    const int identity = isMax ? INT_MIN : INT_MAX;
+
+    if (globalIndex < n) {
+        sharedReduction[localIndex] = input[globalIndex];
+    } else {
+        sharedReduction[localIndex] = identity;
+    }
+
+    __syncthreads();
+
+    // Reducimos por parejas sucesivas hasta dejar un unico valor por bloque.
+    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+        if (localIndex < stride) {
+            sharedReduction[localIndex] =
+                deviceCompareReduction(sharedReduction[localIndex], sharedReduction[localIndex + stride], isMax);
+        }
+
+        __syncthreads();
+    }
+
+    if (localIndex == 0) {
+        output[blockIdx.x] = sharedReduction[0];
     }
 }

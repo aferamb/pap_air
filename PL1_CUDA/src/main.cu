@@ -1,5 +1,6 @@
 #include <cuda_runtime.h>
 
+#include <climits>
 #include <cmath>
 #include <iostream>
 #include <string>
@@ -19,6 +20,7 @@
     - la Fase 0 de lectura y limpieza;
     - la Fase 01 de retraso en despegues;
     - la Fase 02 de retraso en aterrizajes.
+    - la Fase 03 de reduccion de retrasos.
 
     Flujo general actual:
 
@@ -27,8 +29,8 @@
     3. pedir la ruta del CSV y cargarlo;
     4. mostrar resumen de la limpieza y del hardware;
     5. entrar en un menu principal persistente;
-    6. permitir ejecutar las fases 01 y 02;
-    7. dejar preparadas las fases 03 y 04;
+    6. permitir ejecutar las fases 01, 02 y 03;
+    7. dejar preparada la fase 04;
     8. permitir recargar el dataset y consultar el estado.
 
     La CPU se encarga de:
@@ -39,16 +41,16 @@
     - recuperar resultados cuando la fase lo exige.
 
     La GPU se usa ya en las fases 01 y 02 para realizar el filtrado pedido por
-    el enunciado.
+    el enunciado, y tambien en la Fase 03 para ejecutar sus cuatro variantes
+    de reduccion.
 */
 
 /*
     LaunchConfig
 
     Estructura minima para describir una configuracion de lanzamiento sugerida.
-    Aunque los kernels definitivos aun no esten conectados al flujo principal,
-    el programa ya calcula y muestra estos valores para no depender de un
-    numero fijo "porque si" y para respetar la idea del enunciado.
+    Se usa en las fases ya conectadas al flujo principal para no depender de
+    un numero fijo "porque si" y para respetar la idea del enunciado.
 */
 struct LaunchConfig {
     int blocks;
@@ -372,6 +374,552 @@ void printPhase2HostSummary(
                   << detectedValue
                   << " minutos\n";
     }
+}
+
+/*
+    getReductionIdentity
+
+    Devuelve la identidad minima necesaria para inicializar una reduccion:
+
+    - INT_MIN para maximo;
+    - INT_MAX para minimo.
+
+    Esta identidad se usa tanto en host como en kernels para tratar posiciones
+    fuera de rango sin introducir valores falsos en la comparacion.
+*/
+int getReductionIdentity(bool isMax)
+{
+    return isMax ? INT_MIN : INT_MAX;
+}
+
+/*
+    hostCompareReduction
+
+    Version host del comparador de maximo/minimo. Se usa para:
+
+    - cerrar en CPU la variante 3.4;
+    - evitar depender de max()/min() del compilador.
+*/
+int hostCompareReduction(int left, int right, bool isMax)
+{
+    if (isMax) {
+        return left > right ? left : right;
+    }
+
+    return left < right ? left : right;
+}
+
+/*
+    selectPhase3SourceColumn
+
+    Traduce la opcion elegida por el usuario a la columna real del dataset
+    sobre la que trabajara la Fase 03.
+*/
+const std::vector<float>& selectPhase3SourceColumn(
+    const DatasetColumns& dataset,
+    Phase3ColumnOption columnOption)
+{
+    if (columnOption == Phase3ColumnOption::ArrivalDelay) {
+        return dataset.arrDelay;
+    }
+
+    if (columnOption == Phase3ColumnOption::WeatherDelay) {
+        return dataset.weatherDelay;
+    }
+
+    return dataset.depDelay;
+}
+
+/*
+    buildPhase3InputVector
+
+    Prepara el vector compacto de entrada de la Fase 03:
+
+    - ignora posiciones NAN;
+    - trunca cada float valido a entero;
+    - almacena solo los valores realmente utilizables en GPU.
+
+    Aqui si compactamos, porque la reduccion solo necesita operar sobre datos
+    validos y no conservar el indice original del CSV.
+*/
+void buildPhase3InputVector(const std::vector<float>& source, std::vector<int>& outValues)
+{
+    outValues.clear();
+    outValues.reserve(source.size());
+
+    for (std::size_t i = 0; i < source.size(); ++i) {
+        if (std::isnan(source[i])) {
+            continue;
+        }
+
+        outValues.push_back(truncateTowardZero(source[i]));
+    }
+}
+
+/*
+    getPhase3ColumnLabel
+
+    Devuelve el nombre visible de la columna seleccionada por el usuario. Se
+    usa tanto en los resumentes previos como en las lineas finales por
+    variante.
+*/
+const char* getPhase3ColumnLabel(Phase3ColumnOption columnOption)
+{
+    if (columnOption == Phase3ColumnOption::ArrivalDelay) {
+        return "ARR_DELAY";
+    }
+
+    if (columnOption == Phase3ColumnOption::WeatherDelay) {
+        return "WEATHER_DELAY";
+    }
+
+    return "DEP_DELAY";
+}
+
+/*
+    getReductionLabel
+
+    Etiqueta legible para el menu y para los resumentes host de la Fase 03.
+*/
+const char* getReductionLabel(ReductionTypeOption reductionOption)
+{
+    if (reductionOption == ReductionTypeOption::Maximum) {
+        return "Maximo";
+    }
+
+    return "Minimo";
+}
+
+/*
+    getReductionFunctionLabel
+
+    Etiqueta corta del estilo del ejemplo del enunciado: Max() o Min().
+*/
+const char* getReductionFunctionLabel(ReductionTypeOption reductionOption)
+{
+    if (reductionOption == ReductionTypeOption::Maximum) {
+        return "Max";
+    }
+
+    return "Min";
+}
+
+/*
+    printPhase3VariantResult
+
+    Imprime el resultado final de una variante concreta con el formato
+    compacto del enunciado para que las cuatro lineas se puedan comparar
+    rapidamente.
+*/
+void printPhase3VariantResult(
+    const char* variantLabel,
+    Phase3ColumnOption columnOption,
+    ReductionTypeOption reductionOption,
+    int resultValue)
+{
+    std::cout << "[" << variantLabel << "]";
+
+    const int padding = 12 - static_cast<int>(std::char_traits<char>::length(variantLabel));
+
+    for (int i = 0; i < padding; ++i) {
+        std::cout << ' ';
+    }
+
+    std::cout << getReductionFunctionLabel(reductionOption)
+              << "() "
+              << getPhase3ColumnLabel(columnOption)
+              << " = "
+              << resultValue
+              << " minutos\n";
+}
+
+/*
+    runPhase3SimpleVariant
+
+    Host de la variante 3.1. Inicializa un unico acumulador global, lanza el
+    kernel simple y recupera un entero final con el maximo o minimo buscado.
+*/
+bool runPhase3SimpleVariant(
+    int* deviceInput,
+    int totalElements,
+    bool isMax,
+    const LaunchConfig& launchConfig,
+    int& outResult)
+{
+    int* deviceResult = nullptr;
+    const int initialValue = getReductionIdentity(isMax);
+
+    if (!reportCudaFailure(cudaMalloc(reinterpret_cast<void**>(&deviceResult), sizeof(int)),
+        "cudaMalloc deviceResult (Fase 03 - Simple)")) {
+        return false;
+    }
+
+    if (!reportCudaFailure(cudaMemcpy(
+        deviceResult,
+        &initialValue,
+        sizeof(int),
+        cudaMemcpyHostToDevice),
+        "cudaMemcpy H2D deviceResult (Fase 03 - Simple)")) {
+        releaseDeviceAllocation(deviceResult);
+        return false;
+    }
+
+    reductionSimple<<<launchConfig.blocks, launchConfig.threadsPerBlock>>>(
+        deviceInput,
+        deviceResult,
+        totalElements,
+        isMax);
+
+    if (!reportCudaFailure(cudaGetLastError(), "lanzamiento reductionSimple")) {
+        releaseDeviceAllocation(deviceResult);
+        return false;
+    }
+
+    if (!reportCudaFailure(cudaDeviceSynchronize(), "cudaDeviceSynchronize Fase 03 - Simple")) {
+        releaseDeviceAllocation(deviceResult);
+        return false;
+    }
+
+    if (!reportCudaFailure(cudaMemcpy(
+        &outResult,
+        deviceResult,
+        sizeof(int),
+        cudaMemcpyDeviceToHost),
+        "cudaMemcpy D2H deviceResult (Fase 03 - Simple)")) {
+        releaseDeviceAllocation(deviceResult);
+        return false;
+    }
+
+    releaseDeviceAllocation(deviceResult);
+    return true;
+}
+
+/*
+    runPhase3BasicVariant
+
+    Host de la variante 3.2. El resultado sigue siendo un unico acumulador
+    global, pero el kernel usa memoria compartida para consultar anterior,
+    actual y siguiente antes de aplicar la operacion atomica.
+*/
+bool runPhase3BasicVariant(
+    int* deviceInput,
+    int totalElements,
+    bool isMax,
+    const LaunchConfig& launchConfig,
+    int& outResult)
+{
+    int* deviceResult = nullptr;
+    const int initialValue = getReductionIdentity(isMax);
+    const std::size_t sharedBytes =
+        static_cast<std::size_t>(launchConfig.threadsPerBlock + 2) * sizeof(int);
+
+    if (!reportCudaFailure(cudaMalloc(reinterpret_cast<void**>(&deviceResult), sizeof(int)),
+        "cudaMalloc deviceResult (Fase 03 - Basica)")) {
+        return false;
+    }
+
+    if (!reportCudaFailure(cudaMemcpy(
+        deviceResult,
+        &initialValue,
+        sizeof(int),
+        cudaMemcpyHostToDevice),
+        "cudaMemcpy H2D deviceResult (Fase 03 - Basica)")) {
+        releaseDeviceAllocation(deviceResult);
+        return false;
+    }
+
+    reductionBasic<<<launchConfig.blocks, launchConfig.threadsPerBlock, sharedBytes>>>(
+        deviceInput,
+        deviceResult,
+        totalElements,
+        isMax);
+
+    if (!reportCudaFailure(cudaGetLastError(), "lanzamiento reductionBasic")) {
+        releaseDeviceAllocation(deviceResult);
+        return false;
+    }
+
+    if (!reportCudaFailure(cudaDeviceSynchronize(), "cudaDeviceSynchronize Fase 03 - Basica")) {
+        releaseDeviceAllocation(deviceResult);
+        return false;
+    }
+
+    if (!reportCudaFailure(cudaMemcpy(
+        &outResult,
+        deviceResult,
+        sizeof(int),
+        cudaMemcpyDeviceToHost),
+        "cudaMemcpy D2H deviceResult (Fase 03 - Basica)")) {
+        releaseDeviceAllocation(deviceResult);
+        return false;
+    }
+
+    releaseDeviceAllocation(deviceResult);
+    return true;
+}
+
+/*
+    runPhase3IntermediateVariant
+
+    Host de la variante 3.3. El kernel necesita dos zonas compartidas:
+
+    - una para la ventana con halo;
+    - otra para guardar el mejor valor local de cada hilo.
+*/
+bool runPhase3IntermediateVariant(
+    int* deviceInput,
+    int totalElements,
+    bool isMax,
+    const LaunchConfig& launchConfig,
+    int& outResult)
+{
+    int* deviceResult = nullptr;
+    const int initialValue = getReductionIdentity(isMax);
+    const std::size_t sharedBytes =
+        static_cast<std::size_t>((launchConfig.threadsPerBlock + 2) + launchConfig.threadsPerBlock) * sizeof(int);
+
+    if (!reportCudaFailure(cudaMalloc(reinterpret_cast<void**>(&deviceResult), sizeof(int)),
+        "cudaMalloc deviceResult (Fase 03 - Intermedia)")) {
+        return false;
+    }
+
+    if (!reportCudaFailure(cudaMemcpy(
+        deviceResult,
+        &initialValue,
+        sizeof(int),
+        cudaMemcpyHostToDevice),
+        "cudaMemcpy H2D deviceResult (Fase 03 - Intermedia)")) {
+        releaseDeviceAllocation(deviceResult);
+        return false;
+    }
+
+    reductionIntermediate<<<launchConfig.blocks, launchConfig.threadsPerBlock, sharedBytes>>>(
+        deviceInput,
+        deviceResult,
+        totalElements,
+        isMax);
+
+    if (!reportCudaFailure(cudaGetLastError(), "lanzamiento reductionIntermediate")) {
+        releaseDeviceAllocation(deviceResult);
+        return false;
+    }
+
+    if (!reportCudaFailure(cudaDeviceSynchronize(), "cudaDeviceSynchronize Fase 03 - Intermedia")) {
+        releaseDeviceAllocation(deviceResult);
+        return false;
+    }
+
+    if (!reportCudaFailure(cudaMemcpy(
+        &outResult,
+        deviceResult,
+        sizeof(int),
+        cudaMemcpyDeviceToHost),
+        "cudaMemcpy D2H deviceResult (Fase 03 - Intermedia)")) {
+        releaseDeviceAllocation(deviceResult);
+        return false;
+    }
+
+    releaseDeviceAllocation(deviceResult);
+    return true;
+}
+
+/*
+    runPhase3ReductionVariant
+
+    Host de la variante 3.4. Repite el patron de reduccion tantas veces como
+    haga falta hasta dejar un vector de 10 elementos o menos. Ese ultimo tramo
+    se remata en CPU con un bucle sencillo, tal como permite el enunciado.
+*/
+bool runPhase3ReductionVariant(
+    int* deviceInput,
+    int totalElements,
+    bool isMax,
+    const cudaDeviceProp& deviceProp,
+    int& outResult)
+{
+    // currentInput apunta al vector que la siguiente iteracion debe reducir.
+    // Al principio es la entrada original de la fase; despues ira apuntando a
+    // los vectores de parciales generados por la propia variante 3.4.
+    int* currentInput = deviceInput;
+    bool ownsCurrentInput = false;
+    int currentCount = totalElements;
+
+    while (currentCount > 10) {
+        const LaunchConfig launchConfig = computeLaunchConfig(currentCount, deviceProp);
+        const std::size_t partialBytes = static_cast<std::size_t>(launchConfig.blocks) * sizeof(int);
+        const std::size_t sharedBytes = static_cast<std::size_t>(launchConfig.threadsPerBlock) * sizeof(int);
+
+        int* devicePartials = nullptr;
+
+        if (!reportCudaFailure(cudaMalloc(reinterpret_cast<void**>(&devicePartials), partialBytes),
+            "cudaMalloc devicePartials (Fase 03 - Reduccion)")) {
+            if (ownsCurrentInput) {
+                releaseDeviceAllocation(currentInput);
+            }
+            return false;
+        }
+
+        reductionPattern<<<launchConfig.blocks, launchConfig.threadsPerBlock, sharedBytes>>>(
+            currentInput,
+            devicePartials,
+            currentCount,
+            isMax);
+
+        if (!reportCudaFailure(cudaGetLastError(), "lanzamiento reductionPattern")) {
+            releaseDeviceAllocation(devicePartials);
+
+            if (ownsCurrentInput) {
+                releaseDeviceAllocation(currentInput);
+            }
+
+            return false;
+        }
+
+        if (!reportCudaFailure(cudaDeviceSynchronize(), "cudaDeviceSynchronize Fase 03 - Reduccion")) {
+            releaseDeviceAllocation(devicePartials);
+
+            if (ownsCurrentInput) {
+                releaseDeviceAllocation(currentInput);
+            }
+
+            return false;
+        }
+
+        if (ownsCurrentInput) {
+            releaseDeviceAllocation(currentInput);
+        }
+
+        // El vector de parciales pasa a ser la nueva entrada de la siguiente
+        // iteracion. Asi encadenamos reducciones sucesivas hasta cumplir el
+        // limite de 10 elementos pedido por el enunciado.
+        currentInput = devicePartials;
+        ownsCurrentInput = true;
+        currentCount = launchConfig.blocks;
+    }
+
+    // Cuando el tamano ya es pequeno, copiamos ese ultimo vector al host y lo
+    // cerramos con un bucle CPU muy simple.
+    std::vector<int> hostFinalValues(static_cast<std::size_t>(currentCount));
+
+    if (!reportCudaFailure(cudaMemcpy(
+        hostFinalValues.data(),
+        currentInput,
+        static_cast<std::size_t>(currentCount) * sizeof(int),
+        cudaMemcpyDeviceToHost),
+        "cudaMemcpy D2H vector final (Fase 03 - Reduccion)")) {
+        if (ownsCurrentInput) {
+            releaseDeviceAllocation(currentInput);
+        }
+
+        return false;
+    }
+
+    outResult = hostFinalValues[0];
+
+    // Recorremos el tramo final en CPU aplicando la misma comparacion de
+    // maximo/minimo utilizada en GPU.
+    for (int i = 1; i < currentCount; ++i) {
+        outResult = hostCompareReduction(outResult, hostFinalValues[static_cast<std::size_t>(i)], isMax);
+    }
+
+    if (ownsCurrentInput) {
+        releaseDeviceAllocation(currentInput);
+    }
+
+    return true;
+}
+
+/*
+    runPhase3Computation
+
+    Orquesta la Fase 03 completa:
+
+    1. selecciona la columna elegida;
+    2. elimina NAN y trunca a entero;
+    3. copia el vector compacto a GPU;
+    4. ejecuta las 4 variantes obligatorias;
+    5. muestra un resultado final por variante.
+*/
+bool runPhase3Computation(
+    const AppState& appState,
+    Phase3ColumnOption columnOption,
+    ReductionTypeOption reductionOption)
+{
+    const std::vector<float>& sourceColumn =
+        selectPhase3SourceColumn(appState.loadResult.dataset, columnOption);
+
+    std::vector<int> phase3InputValues;
+    buildPhase3InputVector(sourceColumn, phase3InputValues);
+
+    const int totalElements = static_cast<int>(phase3InputValues.size());
+
+    if (totalElements <= 0) {
+        std::cout << "No hay valores validos en la columna seleccionada para ejecutar la Fase 03.\n";
+        return false;
+    }
+
+    const bool isMax = reductionOption == ReductionTypeOption::Maximum;
+    const LaunchConfig launchConfig = computeLaunchConfig(totalElements, appState.deviceProp);
+    const std::size_t inputBytes = phase3InputValues.size() * sizeof(int);
+
+    std::cout << "- Valores validos tras ignorar NAN: " << phase3InputValues.size() << "\n";
+    std::cout << "- Configuracion sugerida actual: "
+              << launchConfig.blocks << " bloques x "
+              << launchConfig.threadsPerBlock << " hilos\n";
+
+    int* deviceInput = nullptr;
+
+    if (!reportCudaFailure(cudaMalloc(reinterpret_cast<void**>(&deviceInput), inputBytes),
+        "cudaMalloc deviceInput (Fase 03)")) {
+        return false;
+    }
+
+    if (!reportCudaFailure(cudaMemcpy(
+        deviceInput,
+        phase3InputValues.data(),
+        inputBytes,
+        cudaMemcpyHostToDevice),
+        "cudaMemcpy H2D deviceInput (Fase 03)")) {
+        releaseDeviceAllocation(deviceInput);
+        return false;
+    }
+
+    // Guardamos un resultado por variante para poder compararlas al final en
+    // el mismo formato que sugiere el enunciado.
+    int simpleResult = 0;
+    int basicResult = 0;
+    int intermediateResult = 0;
+    int reductionResult = 0;
+
+    if (!runPhase3SimpleVariant(deviceInput, totalElements, isMax, launchConfig, simpleResult)) {
+        releaseDeviceAllocation(deviceInput);
+        return false;
+    }
+
+    if (!runPhase3BasicVariant(deviceInput, totalElements, isMax, launchConfig, basicResult)) {
+        releaseDeviceAllocation(deviceInput);
+        return false;
+    }
+
+    if (!runPhase3IntermediateVariant(deviceInput, totalElements, isMax, launchConfig, intermediateResult)) {
+        releaseDeviceAllocation(deviceInput);
+        return false;
+    }
+
+    if (!runPhase3ReductionVariant(deviceInput, totalElements, isMax, appState.deviceProp, reductionResult)) {
+        releaseDeviceAllocation(deviceInput);
+        return false;
+    }
+
+    releaseDeviceAllocation(deviceInput);
+
+    std::cout << "\nResultados Fase 03:\n";
+    printPhase3VariantResult("Simple", columnOption, reductionOption, simpleResult);
+    printPhase3VariantResult("Basica", columnOption, reductionOption, basicResult);
+    printPhase3VariantResult("Intermedia", columnOption, reductionOption, intermediateResult);
+    printPhase3VariantResult("Reduccion", columnOption, reductionOption, reductionResult);
+
+    return true;
 }
 
 /*
@@ -999,12 +1547,12 @@ void runPhase2Shell(const AppState& appState)
 /*
     runPhase3Shell
 
-    Prepara la interfaz de la Fase 03:
+    Submenu real de la Fase 03:
 
     - pide columna de trabajo;
     - pide tipo de reduccion;
     - resume la configuracion elegida;
-    - recuerda las variantes que quedaran por implementar.
+    - ejecuta las cuatro variantes obligatorias en GPU.
 */
 void runPhase3Shell(const AppState& appState)
 {
@@ -1012,6 +1560,13 @@ void runPhase3Shell(const AppState& appState)
 
     if (!appState.datasetLoaded) {
         std::cout << "No hay dataset cargado. Cargue un CSV antes de continuar.\n";
+        waitForEnter();
+        return;
+    }
+
+    if (!appState.deviceReady) {
+        std::cout << "No hay GPU CUDA disponible para ejecutar la Fase 03.\n";
+        std::cout << "Motivo: " << appState.deviceErrorMessage << "\n";
         waitForEnter();
         return;
     }
@@ -1034,24 +1589,17 @@ void runPhase3Shell(const AppState& appState)
         return;
     }
 
-    const char* selectedColumn = "DEP_DELAY";
-
-    // Convertimos la opcion numerica en una etiqueta legible para el resumen.
-    if (columnOption == static_cast<int>(Phase3ColumnOption::ArrivalDelay)) {
-        selectedColumn = "ARR_DELAY";
-    } else if (columnOption == static_cast<int>(Phase3ColumnOption::WeatherDelay)) {
-        selectedColumn = "WEATHER_DELAY";
-    }
-
-    const char* selectedReduction =
-        reductionOption == static_cast<int>(ReductionTypeOption::Maximum) ? "Maximo" : "Minimo";
+    const Phase3ColumnOption selectedColumn = static_cast<Phase3ColumnOption>(columnOption);
+    const ReductionTypeOption selectedReduction = static_cast<ReductionTypeOption>(reductionOption);
 
     std::cout << "\nConfiguracion capturada:\n";
-    std::cout << "- Columna objetivo: " << selectedColumn << "\n";
-    std::cout << "- Reduccion: " << selectedReduction << "\n";
-    std::cout << "- Variantes futuras: Simple, Basica, Intermedia y Patron de reduccion\n";
-    printSuggestedLaunchConfigIfAvailable(appState);
-    printPhasePendingMessage("Fase 03");
+    std::cout << "- Columna objetivo: " << getPhase3ColumnLabel(selectedColumn) << "\n";
+    std::cout << "- Reduccion: " << getReductionLabel(selectedReduction) << "\n";
+
+    if (!runPhase3Computation(appState, selectedColumn, selectedReduction)) {
+        std::cout << "La Fase 03 no se ha podido completar correctamente.\n";
+    }
+
     waitForEnter();
 }
 
