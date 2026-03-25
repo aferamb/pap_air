@@ -130,22 +130,22 @@ void printMainMenu()
     std::cout << "X. Salir\n";
 }
 
-// Cabecera del submenu de Fase 01. Sirve para situar al usuario antes de pedir
-// el umbral, aunque la logica CUDA real aun no este conectada.
+// Cabecera del submenu de Fase 01. Situa al usuario antes de pedir el umbral
+// y recuerda que el filtrado se ejecutara sobre DEP_DELAY en GPU.
 void printPhase1Menu()
 {
     std::cout << "\n=== Fase 01 - Retraso en despegues ===\n";
     std::cout << "Se trabajara sobre la columna DEP_DELAY.\n";
-    std::cout << "La interfaz ya recoge el umbral firmado.\n";
+    std::cout << "Se pediran tipo de filtro y umbral no negativo.\n";
 }
 
-// Cabecera del submenu de Fase 02. Deja claro que la fase futura combina
-// ARR_DELAY con TAIL_NUM.
+// Cabecera del submenu de Fase 02. Deja claro que la fase combina ARR_DELAY
+// con TAIL_NUM y que devolvera resultados tambien al host.
 void printPhase2Menu()
 {
     std::cout << "\n=== Fase 02 - Retraso en aterrizajes ===\n";
     std::cout << "Se trabajara sobre ARR_DELAY y TAIL_NUM.\n";
-    std::cout << "La interfaz ya recoge el umbral firmado.\n";
+    std::cout << "Se pediran tipo de filtro y umbral no negativo.\n";
 }
 
 // Cabecera del submenu de Fase 03.
@@ -282,6 +282,46 @@ bool readSignedInt(const std::string& prompt, int& value)
         }
 
         std::cout << "Debe introducir un entero valido o X para volver.\n";
+    }
+}
+
+/*
+    readDelayFilterModeOption
+
+    Interpreta el modo de filtrado de Fase 01 y Fase 02. La decision de
+    permitir Intro = Both sirve para ofrecer un camino rapido cuando el usuario
+    quiere buscar tanto retrasos como adelantos sin elegir una sola rama.
+*/
+bool readDelayFilterModeOption(const std::string& prompt, DelayFilterMode& value)
+{
+    while (true) {
+        std::cout << "1. Retraso\n";
+        std::cout << "2. Adelanto\n";
+        std::cout << "3. Ambos\n";
+        std::cout << "Intro. Ambos\n";
+
+        const std::string input = readTrimmedLine(prompt);
+
+        if (isCancelToken(input)) {
+            return false;
+        }
+
+        if (input.empty() || input == "3") {
+            value = DelayFilterMode::Both;
+            return true;
+        }
+
+        if (input == "1") {
+            value = DelayFilterMode::Delay;
+            return true;
+        }
+
+        if (input == "2") {
+            value = DelayFilterMode::Advance;
+            return true;
+        }
+
+        std::cout << "Debe introducir 1, 2, 3, Intro o X para volver.\n";
     }
 }
 

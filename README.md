@@ -3,18 +3,19 @@
 ## Estado actual del proyecto
 
 Este repositorio contiene una practica academica de **CUDA C/C++** basada en el
-**US Airline Dataset**. En el estado actual del codigo, la parte realmente
-implementada es la **Fase 0**:
+**US Airline Dataset**. En el estado actual del codigo, las partes realmente
+implementadas son la **Fase 0**, la **Fase 01** y la **Fase 02**:
 
 - lectura del CSV desde disco;
 - limpieza basica y validacion de cabecera;
 - carga del dataset en memoria del host usando una estructura por columnas;
 - calculo de estadisticas de calidad de datos;
 - deteccion del hardware CUDA disponible;
-- interfaz de consola completa y navegable para las Fases 1-4.
+- interfaz de consola completa y navegable para las Fases 1-4;
+- filtrado CUDA de `DEP_DELAY` para la Fase 01;
+- filtrado CUDA de `ARR_DELAY` + `TAIL_NUM` para la Fase 02.
 
-Las **Fases 1, 2, 3 y 4** ya tienen su flujo de menu preparado, pero todavia no
-ejecutan su logica CUDA definitiva desde `main.cu`.
+Las **Fases 03 y 04** siguen teniendo solo el flujo de menu preparado.
 
 ---
 
@@ -40,9 +41,9 @@ El proyecto principal es `PL1_CUDA` y los archivos mas importantes son:
 - `PL1_CUDA/src/cli_utils.cpp`
   - implementa menus, lectura segura de opciones y pausas entre pantallas.
 - `PL1_CUDA/src/kernels.cuh`
-  - declara el kernel `reductionSimple`.
+  - declara los kernels de Fase 01, Fase 02 y `reductionSimple`.
 - `PL1_CUDA/src/kernels.cu`
-  - implementa una reduccion simple en GPU con atomicas.
+  - implementa los kernels CUDA actuales del proyecto.
 - `PL1_CUDA/cuda.local.props.example`
   - plantilla de configuracion local para la version de CUDA de cada miembro.
 
@@ -114,16 +115,17 @@ Cuando se ejecuta el programa, el flujo actual es este:
 8. Al terminar la carga, `main()` muestra el resumen de Fase 0.
 9. El programa entra en un menu persistente con las opciones de las cuatro
    fases, recarga del CSV, estado y salida.
-10. Si el usuario entra en una fase, la CLI recoge los parametros y muestra un
-    mensaje de "fase pendiente de implementar".
+10. Si el usuario entra en Fase 01 o Fase 02, la aplicacion prepara buffers en
+    host, lanza el kernel y muestra los resultados.
+11. Si el usuario entra en Fase 03 o Fase 04, la CLI sigue recogiendo los
+    parametros, pero esas fases aun estan pendientes.
 
 En otras palabras:
 
-- la **CPU** ya gestiona lectura, limpieza, validacion, estado y menus;
-- la **GPU** hoy solo se consulta para detectar hardware y sugerir una futura
-  configuracion de lanzamiento;
-- el kernel de reduccion existe en el repositorio, pero no esta conectado al
-  flujo principal actual.
+- la **CPU** gestiona lectura, limpieza, validacion, estado, menus y
+  preparacion de buffers;
+- la **GPU** ya ejecuta los kernels de Fase 01 y Fase 02;
+- el kernel de reduccion sigue existiendo como base futura de la Fase 03.
 
 ---
 
@@ -244,6 +246,9 @@ Separar del `main` todo lo relacionado con:
   - convierte la entrada del usuario en un `MainMenuOption`.
 - `readSignedInt(...)`
   - valida enteros firmados para umbrales.
+- `readDelayFilterModeOption(...)`
+  - pide `retraso`, `adelanto` o `ambos`;
+  - si el usuario pulsa Intro, selecciona `ambos`.
 - `readBoundedIntOption(...)`
   - valida opciones numericas dentro de un rango cerrado.
 - `waitForEnter()`
@@ -264,19 +269,25 @@ Separar del `main` todo lo relacionado con:
 Cada fase ya tiene su propia pantalla de entrada:
 
 - Fase 01
-  - pide el umbral firmado para `DEP_DELAY`.
+  - pide tipo de filtro y umbral para `DEP_DELAY`.
 - Fase 02
-  - pide el umbral firmado para `ARR_DELAY`.
+  - pide tipo de filtro y umbral para `ARR_DELAY`.
 - Fase 03
   - pide columna y tipo de reduccion.
 - Fase 04
   - pide origen/destino y umbral minimo.
 
-Por ahora, tras recoger esos parametros, la aplicacion:
+Comportamiento actual de los submenus:
 
-- resume la configuracion elegida;
-- muestra la configuracion de lanzamiento sugerida si ya hay dataset y GPU;
-- avisa de que la logica CUDA de esa fase aun esta pendiente.
+- Fase 01
+  - ejecuta el kernel de filtrado sobre `DEP_DELAY`.
+- Fase 02
+  - ejecuta el kernel de filtrado sobre `ARR_DELAY` y devuelve resultados al
+    host.
+- Fase 03
+  - sigue pendiente.
+- Fase 04
+  - sigue pendiente.
 
 ---
 
@@ -320,71 +331,110 @@ Por ahora, tras recoger esos parametros, la aplicacion:
 - `printSuggestedLaunchConfigIfAvailable(...)`
   - muestra una configuracion futura de lanzamiento para el dataset cargado.
 - `runPhase1Shell(...)`
+  - pide umbral y ejecuta la Fase 01.
 - `runPhase2Shell(...)`
+  - pide umbral y ejecuta la Fase 02.
 - `runPhase3Shell(...)`
 - `runPhase4Shell(...)`
-  - son los submenus actuales de las fases futuras.
+  - siguen siendo los submenus actuales de las fases futuras.
 
 ### Flujo de llamadas real
 
-```text
-main()
--> printApplicationBanner()
--> queryGpuInfo()
--> printGpuSummary()
--> promptAndLoadDataset()
-   -> promptDatasetPath()
-   -> loadDatasetIntoState()
-      -> loadDataset()
-         -> splitCsvLineSimple()
-         -> cleanQuotedToken()
-         -> validateHeader()
-         -> parseFloatOrNan()
-         -> parseIntFromFloatToken()
--> waitForEnter()
--> bucle del menu principal
-   -> readMainMenuOption()
-   -> runPhase1Shell() / runPhase2Shell() / runPhase3Shell() / runPhase4Shell()
-   -> printApplicationState()
-   -> promptAndLoadDataset() al recargar
+```mermaid
+flowchart TD
+    A[main] --> B[printApplicationBanner]
+    B --> C[queryGpuInfo]
+    C --> D[printGpuSummary]
+    D --> E[promptAndLoadDataset]
+
+    E --> F[promptDatasetPath]
+    F --> G{Ruta valida?}
+    G -- No --> F
+    G -- Si --> H[loadDatasetIntoState]
+
+    H --> I[loadDataset]
+    I --> J[splitCsvLineSimple]
+    J --> K[cleanQuotedToken]
+    K --> L[validateHeader]
+    L --> M[parseFloatOrNan]
+    M --> N[parseIntFromFloatToken]
+    N --> O{Carga correcta?}
+
+    O -- No --> P[Mostrar error y pedir otra ruta]
+    P --> F
+    O -- Si --> Q[Guardar CsvLoadResult en AppState]
+    Q --> R[printLoadSummary]
+    R --> S[waitForEnter]
+    S --> T[Bucle del menu principal]
+
+    T --> U[readMainMenuOption]
+    U --> V[runPhase1Shell / runPhase2Shell / runPhase3Shell / runPhase4Shell]
+    U --> W[printApplicationState]
+    U --> X[promptAndLoadDataset al recargar]
+    V --> T
+    W --> T
+    X --> T
 ```
+
+### Explicacion del flujo
+
+- `main()` inicia la aplicacion, consulta la GPU y fuerza una carga inicial del
+  dataset antes de mostrar el menu.
+- `promptAndLoadDataset()` controla la interaccion con el usuario para elegir
+  la ruta del CSV y repetir el intento si la carga falla.
+- `loadDatasetIntoState()` hace de puente entre el lector CSV y la aplicacion:
+  llama a `loadDataset(...)` y, si todo va bien, copia el resultado dentro de
+  `AppState`.
+- `loadDataset()` ejecuta toda la Fase 0 en CPU:
+  - abre el fichero;
+  - valida la cabecera;
+  - trocea cada linea;
+  - limpia tokens;
+  - convierte numeros y textos;
+  - almacena el dataset limpio en memoria del host.
+- Las funciones `splitCsvLineSimple(...)`, `cleanQuotedToken(...)`,
+  `validateHeader(...)`, `parseFloatOrNan(...)` y
+  `parseIntFromFloatToken(...)` son helpers internos del lector y se ejecutan
+  durante esa carga.
+- Cuando la carga termina bien, el resultado queda guardado en
+  `appState.loadResult`, de forma que el menu y las fases futuras reutilizan el
+  dataset sin volver a leer el CSV.
+- Las Fases 01 y 02 preparan sus buffers desde `appState.loadResult.dataset` y
+  lanzan sus kernels sin recargar el fichero.
 
 ---
 
-## El kernel que existe ahora mismo
+## Kernels actuales
 
-Aunque el flujo principal actual no lo llama, el repositorio mantiene un kernel
-en `kernels.cu`:
+El archivo `kernels.cu` mantiene estos kernels:
 
 ```cpp
+__global__ void phase1DepartureDelayKernel(...);
+__global__ void phase2ArrivalDelayKernel(...);
 __global__ void reductionSimple(int* data, int* result, int n, bool isMax);
 ```
 
-### Que hace `reductionSimple`
+### Que hace cada kernel
 
-Cada hilo:
+- `phase1DepartureDelayKernel`
+  - mira una posicion de `DEP_DELAY`;
+  - ignora `NAN` usando una mascara de validez;
+  - aplica `retraso`, `adelanto` o `ambos` segun el modo elegido;
+  - imprime hilo global y valor detectado.
+- `phase2ArrivalDelayKernel`
+  - mira una posicion de `ARR_DELAY`;
+  - lee modo y umbral desde memoria constante;
+  - usa `atomicAdd` para reservar hueco en la salida;
+  - guarda retraso y matricula en arrays simples;
+  - imprime hilo global, matricula y tipo detectado.
+- `reductionSimple`
+  - se conserva como base de la variante 3.1 de la Fase 03.
 
-1. calcula su indice global 1D;
-2. comprueba si ese indice esta dentro de rango;
-3. lee un valor del vector `data`;
-4. aplica:
-   - `atomicMax(result, value)` si se busca maximo;
-   - `atomicMin(result, value)` si se busca minimo.
-
-### Para que sirve hoy
-
-Sirve como referencia del trabajo CUDA ya existente en el repositorio y como
-base de lo que en su momento fue una reduccion simple.
-
-### Que no hace hoy
-
-- no se lanza desde el `main` actual;
-- no participa en la Fase 0;
-- no implementa aun el flujo completo exigido por la practica para Fase 03.
+`reductionSimple` no se lanza todavia desde `main.cu`.
 
 ---
 
-## Que se procesa en CPU y que se procesara en GPU
+## Que se procesa en CPU y que se procesa en GPU
 
 ### Hoy en CPU
 
@@ -396,19 +446,22 @@ base de lo que en su momento fue una reduccion simple.
 - conteo de aeropuertos unicos;
 - menus por consola;
 - captura de parametros del usuario;
-- consulta del hardware CUDA.
+- consulta del hardware CUDA;
+- truncado de columnas a enteros para Fase 01 y Fase 02;
+- linealizacion de `TAIL_NUM` para Fase 02;
+- copia de resultados de Fase 02 desde device a host.
 
 ### Hoy en GPU
 
-- nada dentro del flujo principal actual;
-- solo existe el kernel `reductionSimple` como implementacion aislada.
+- Fase 01:
+  - filtrado de `DEP_DELAY` segun tipo de filtro y umbral absoluto.
+- Fase 02:
+  - filtrado de `ARR_DELAY` segun tipo de filtro y umbral absoluto;
+  - uso de memoria constante para modo y umbral;
+  - uso de atomicas para contar y reservar salidas.
 
 ### Futuro previsto segun la estructura actual
 
-- Fase 01
-  - filtrado por umbral sobre `DEP_DELAY`.
-- Fase 02
-  - deteccion por `ARR_DELAY` y `TAIL_NUM` con memoria constante y atomicas.
 - Fase 03
   - reducciones de maximo/minimo sobre columnas de retraso.
 - Fase 04
@@ -424,8 +477,8 @@ Si hay que explicar el codigo hoy, la idea clave es esta:
 - ya tiene una **CLI completa** para el flujo de la practica;
 - ya tiene un **estado global coherente** en `AppState`;
 - ya conoce el **hardware CUDA disponible**;
-- ya conserva un **kernel simple** de reduccion como referencia;
-- pero todavia falta conectar e implementar la logica real de las Fases 1-4.
+- ya ejecuta de forma real las **Fases 01 y 02**;
+- y deja pendientes solo las **Fases 03 y 04**.
 
 La defensa actual debe centrarse en:
 
@@ -434,7 +487,8 @@ La defensa actual debe centrarse en:
 - por que los IDs enteros usan `-1` como centinela;
 - por que la CLI esta separada en `cli_utils`;
 - por que se consulta el hardware antes de fijar una configuracion de lanzamiento;
-- y por que el kernel existente aun no forma parte del flujo principal.
+- por que Fase 02 usa memoria constante y atomicas;
+- y por que Fase 03 aun no forma parte del flujo principal.
 
 ---
 
@@ -442,24 +496,22 @@ La defensa actual debe centrarse en:
 
 En el estado actual del proyecto:
 
-- las Fases 1-4 aun no ejecutan su computo CUDA real;
-- no hay comprobacion sistematica de errores CUDA en cada llamada futura porque
-  esas llamadas aun no se han integrado;
+- las Fases 03 y 04 aun no ejecutan su computo CUDA real;
 - el build depende de que cada maquina tenga `CUDA_PATH` bien definido o, en su
   defecto, un `cuda.local.props` correcto;
 - el parser CSV es sencillo y deliberadamente limitado al dataset de la practica;
 - la aplicacion depende de que la cabecera del CSV coincida con el formato
   esperado;
+- la salida con `printf` desde GPU puede aparecer intercalada entre hilos;
 - no hay tests automaticos integrados en este entorno.
 
 ---
 
 ## Siguiente paso natural
 
-El siguiente paso tecnico coherente es implementar la **Fase 01** sobre esta
+El siguiente paso tecnico coherente es implementar la **Fase 03** sobre esta
 base ya preparada:
 
-- reutilizando `DatasetColumns`;
-- construyendo un buffer entero a partir de `DEP_DELAY`;
-- usando `LaunchConfig` calculado segun hardware;
-- y conectando desde `runPhase1Shell(...)` el kernel correspondiente.
+- reutilizando el mismo esquema de buffers simples y lanzamiento por hardware;
+- manteniendo el acceso linealizado 1D;
+- y conservando el estilo sencillo y muy comentado de las Fases 01 y 02.

@@ -1,12 +1,90 @@
 #pragma once
 
+#include <cuda_runtime.h>
+
 /*
     kernels.cuh
 
-    Este header declara el kernel CUDA mas simple que existe ahora mismo en el
-    repositorio. Aunque la Fase 0 no lo ejecuta desde main, el kernel se sigue
-    conservando porque representa la base actual de una reduccion elemental.
+    Este header reune los kernels CUDA que ya forman parte del proyecto.
+
+    Estado actual:
+
+    - Fase 01: deteccion de retrasos o adelantos en despegues sobre DEP_DELAY;
+    - Fase 02: deteccion de retrasos o adelantos en aterrizajes sobre
+      ARR_DELAY + TAIL_NUM usando memoria constante y atomicas;
+    - Fase 03.1: reduccion simple conservada como referencia previa.
+
+    La idea es que main.cu pueda incluir este archivo y disponer de las
+    declaraciones necesarias sin mezclar la implementacion CUDA dentro del
+    orquestador principal.
 */
+
+// Tamano fijo reservado para cada matricula en la Fase 02. Se usa un stride
+// simple para poder linealizar strings en un unico buffer de chars.
+constexpr int kPhase2TailNumStride = 16;
+
+/*
+    phase1DepartureDelayKernel
+
+    Kernel de la Fase 01. Cada hilo analiza una posicion del vector DEP_DELAY
+    ya truncado a entero en host. Si el dato es valido y supera el criterio del
+    umbral, el hilo muestra por consola:
+
+    - su identificador global;
+    - el valor detectado.
+
+    Parametros:
+
+    - delayValues: vector de retrasos truncados a entero;
+    - validMask: mascara 0/1 para ignorar posiciones que en host eran NAN;
+    - totalElements: numero total de filas procesables;
+    - mode: 1=retraso, 2=adelanto, 3=ambos;
+    - threshold: umbral absoluto no negativo introducido por el usuario.
+*/
+__global__ void phase1DepartureDelayKernel(
+    const int* delayValues,
+    const unsigned char* validMask,
+    int totalElements,
+    int mode,
+    int threshold);
+
+/*
+    copyPhase2FilterConfigToConstant
+
+    Helper host para copiar a memoria constante la configuracion minima de la
+    Fase 02: modo y umbral.
+*/
+cudaError_t copyPhase2FilterConfigToConstant(int mode, int threshold);
+
+/*
+    phase2ArrivalDelayKernel
+
+    Kernel de la Fase 02. Cada hilo analiza una posicion de ARR_DELAY y, si la
+    posicion cumple el criterio del modo y del umbral almacenados en memoria
+    constante:
+
+    - reserva una salida con atomicAdd;
+    - guarda retraso y matricula en arrays simples de salida;
+    - muestra la informacion por consola desde GPU.
+
+    Parametros:
+
+    - delayValues: vector ARR_DELAY truncado a entero;
+    - validMask: mascara 0/1 para ignorar NAN;
+    - tailNumIn: buffer linealizado de matriculas de entrada;
+    - totalElements: numero total de filas;
+    - outCount: contador global de resultados encontrados;
+    - outDelayValues: array simple de retrasos detectados;
+    - outTailNumBuffer: array simple de matriculas detectadas.
+*/
+__global__ void phase2ArrivalDelayKernel(
+    const int* delayValues,
+    const unsigned char* validMask,
+    const char* tailNumIn,
+    int totalElements,
+    int* outCount,
+    int* outDelayValues,
+    char* outTailNumBuffer);
 
 /*
     reductionSimple

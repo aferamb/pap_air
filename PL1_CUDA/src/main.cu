@@ -1,18 +1,24 @@
 #include <cuda_runtime.h>
 
+#include <cmath>
 #include <iostream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "cli_utils.h"
 #include "csv_reader.h"
+#include "kernels.cuh"
 
 /*
     main.cu
 
     Este archivo coordina el estado actual del programa. Hoy la aplicacion
-    implementa de forma real la Fase 0 y deja preparada la interfaz para el
-    resto de fases de la practica.
+    implementa de forma real:
+
+    - la Fase 0 de lectura y limpieza;
+    - la Fase 01 de retraso en despegues;
+    - la Fase 02 de retraso en aterrizajes.
 
     Flujo general actual:
 
@@ -21,12 +27,19 @@
     3. pedir la ruta del CSV y cargarlo;
     4. mostrar resumen de la limpieza y del hardware;
     5. entrar en un menu principal persistente;
-    6. permitir navegar por las fases 1-4, aunque aun esten pendientes;
-    7. permitir recargar el dataset y consultar el estado.
+    6. permitir ejecutar las fases 01 y 02;
+    7. dejar preparadas las fases 03 y 04;
+    8. permitir recargar el dataset y consultar el estado.
 
-    Toda la logica de esta iteracion se mantiene en host. La GPU se consulta
-    para conocer el hardware y dejar preparada la configuracion futura de los
-    kernels, pero las fases 1-4 todavia no ejecutan su computo CUDA real.
+    La CPU se encarga de:
+
+    - cargar y limpiar el CSV;
+    - preparar buffers sencillos para GPU;
+    - lanzar kernels;
+    - recuperar resultados cuando la fase lo exige.
+
+    La GPU se usa ya en las fases 01 y 02 para realizar el filtrado pedido por
+    el enunciado.
 */
 
 /*
@@ -113,7 +126,7 @@ std::vector<std::string> buildDatasetCandidates(const AppState& appState)
     std::vector<std::string> candidates;
 
     appendCandidateIfMissing(candidates, appState.datasetPath);
-    appendCandidateIfMissing(candidates, "data/Airline_dataset.csv");
+    appendCandidateIfMissing(candidates, "src/data/Airline_dataset.csv");
 
     return candidates;
 }
@@ -180,6 +193,525 @@ LaunchConfig computeLaunchConfig(int totalElements, const cudaDeviceProp& device
     }
 
     return launchConfig;
+}
+
+/*
+    reportCudaFailure
+
+    Helper minimo para centralizar la impresion de errores CUDA. La funcion
+    devuelve true si la llamada ha ido bien y false si ha fallado, de forma que
+    el codigo de las fases pueda encadenar comprobaciones sin repetir siempre
+    el mismo bloque de salida por consola.
+*/
+bool reportCudaFailure(cudaError_t status, const char* context)
+{
+    if (status == cudaSuccess) {
+        return true;
+    }
+
+    std::cout << "\nError CUDA en " << context << ": "
+              << cudaGetErrorString(status) << "\n";
+    return false;
+}
+
+/*
+    getDelayFilterModeLabel
+
+    Convierte el enum usado en la CLI y en el host a una etiqueta legible para
+    mostrar resumentes de configuracion y mantener el flujo facil de seguir.
+*/
+const char* getDelayFilterModeLabel(DelayFilterMode mode)
+{
+    switch (mode) {
+    case DelayFilterMode::Delay:
+        return "retraso";
+    case DelayFilterMode::Advance:
+        return "adelanto";
+    case DelayFilterMode::Both:
+    default:
+        return "ambos";
+    }
+}
+
+/*
+    detectDelayFilterLabel
+
+    Etiqueta un valor concreto segun el umbral absoluto y el modo elegido.
+    Esto permite que los resumentes host y device describan correctamente cada
+    fila detectada, especialmente cuando el modo es "ambos".
+*/
+const char* detectDelayFilterLabel(int value, DelayFilterMode mode, int threshold)
+{
+    if (mode == DelayFilterMode::Delay) {
+        return "Retraso";
+    }
+
+    if (mode == DelayFilterMode::Advance) {
+        return "Adelanto";
+    }
+
+    // En modo "ambos" el dato concreto decide la etiqueta final.
+    if (value >= threshold) {
+        return "Retraso";
+    }
+
+    return "Adelanto";
+}
+
+/*
+    releaseDeviceAllocation
+
+    Libera un puntero device solo si realmente se habia reservado. Se usa para
+    simplificar la limpieza de errores sin duplicar comprobaciones nulas en
+    cada fase.
+*/
+void releaseDeviceAllocation(void* devicePointer)
+{
+    if (devicePointer != nullptr) {
+        cudaFree(devicePointer);
+    }
+}
+
+/*
+    truncateTowardZero
+
+    La practica pide trabajar con enteros cuando estas fases lo necesiten.
+    El cast a int en C/C++ trunca hacia cero, que es exactamente la semantica
+    sencilla que queremos mantener en host.
+*/
+int truncateTowardZero(float value)
+{
+    return static_cast<int>(value);
+}
+
+/*
+    buildIntDelayBuffer
+
+    Convierte una columna float del dataset en dos buffers paralelos:
+
+    - outValues: retrasos truncados a entero;
+    - outValidMask: mascara 0/1 para indicar si el dato original era valido.
+
+    Se evita compactar el dataset para conservar el mismo indice global que
+    usan las filas del CSV. Asi, el hilo CUDA i sigue representando la fila i.
+*/
+void buildIntDelayBuffer(
+    const std::vector<float>& source,
+    std::vector<int>& outValues,
+    std::vector<unsigned char>& outValidMask)
+{
+    outValues.resize(source.size());
+    outValidMask.resize(source.size());
+
+    for (std::size_t i = 0; i < source.size(); ++i) {
+        // Si el valor original es NAN, dejamos una mascara a 0 y un valor
+        // neutro que nunca deberia usarse porque el kernel lo ignorara.
+        if (std::isnan(source[i])) {
+            outValues[i] = 0;
+            outValidMask[i] = 0;
+            continue;
+        }
+
+        outValues[i] = truncateTowardZero(source[i]);
+        outValidMask[i] = 1;
+    }
+}
+
+/*
+    buildTailNumFixedBuffer
+
+    Linealiza el vector de matriculas en un unico buffer de chars con stride
+    fijo. Esta es la forma mas simple de llevar strings a GPU sin introducir
+    estructuras mas complejas de lo necesario.
+*/
+void buildTailNumFixedBuffer(const std::vector<std::string>& source, std::vector<char>& outBuffer)
+{
+    outBuffer.assign(source.size() * kPhase2TailNumStride, '\0');
+
+    for (std::size_t row = 0; row < source.size(); ++row) {
+        const std::string& tailNum = source[row];
+        char* outputCell = &outBuffer[row * kPhase2TailNumStride];
+
+        // Copiamos como maximo stride - 1 para reservar siempre un '\0' final.
+        const std::size_t maxCharacters = static_cast<std::size_t>(kPhase2TailNumStride - 1);
+        const std::size_t charactersToCopy =
+            tailNum.size() < maxCharacters ? tailNum.size() : maxCharacters;
+
+        for (std::size_t i = 0; i < charactersToCopy; ++i) {
+            outputCell[i] = tailNum[i];
+        }
+
+        outputCell[charactersToCopy] = '\0';
+    }
+}
+
+/*
+    printPhase2HostSummary
+
+    La Fase 02 debe devolver al host el numero de aviones detectados y arrays
+    simples con matriculas y tiempos. Esta funcion muestra ese resumen final en
+    CPU utilizando justo esos buffers ya copiados desde device.
+*/
+void printPhase2HostSummary(
+    DelayFilterMode mode,
+    int threshold,
+    int resultCount,
+    const std::vector<int>& outDelayValues,
+    const std::vector<char>& outTailNumBuffer)
+{
+    std::cout << "\nResultados completados de calcular en la CPU:\n";
+    std::cout << "Se han encontrado " << resultCount << " aviones\n";
+
+    for (int i = 0; i < resultCount; ++i) {
+        const char* tailNum = &outTailNumBuffer[static_cast<std::size_t>(i) * kPhase2TailNumStride];
+        const int detectedValue = outDelayValues[static_cast<std::size_t>(i)];
+        const char* detectedLabel = detectDelayFilterLabel(detectedValue, mode, threshold);
+
+        std::cout << "- Matricula " << tailNum
+                  << "  " << detectedLabel << ": "
+                  << detectedValue
+                  << " minutos\n";
+    }
+}
+
+/*
+    runPhase1Computation
+
+    Implementacion host de la Fase 01. Su responsabilidad es preparar buffers
+    sencillos, reservar memoria CUDA, lanzar el kernel y sincronizar para que
+    la salida por consola desde GPU se vea antes de volver al menu.
+*/
+bool runPhase1Computation(const AppState& appState, DelayFilterMode mode, int threshold)
+{
+    const DatasetColumns& dataset = appState.loadResult.dataset;
+
+    std::vector<int> depDelayValues;
+    std::vector<unsigned char> depDelayValidMask;
+    buildIntDelayBuffer(dataset.depDelay, depDelayValues, depDelayValidMask);
+
+    const int totalElements = static_cast<int>(depDelayValues.size());
+
+    if (totalElements <= 0) {
+        std::cout << "No hay datos disponibles para ejecutar la Fase 01.\n";
+        return false;
+    }
+
+    const LaunchConfig launchConfig = computeLaunchConfig(totalElements, appState.deviceProp);
+
+    int* deviceDelayValues = nullptr;
+    unsigned char* deviceValidMask = nullptr;
+
+    const std::size_t delayBufferBytes = depDelayValues.size() * sizeof(int);
+    const std::size_t validMaskBytes = depDelayValidMask.size() * sizeof(unsigned char);
+
+    if (!reportCudaFailure(cudaMalloc(reinterpret_cast<void**>(&deviceDelayValues), delayBufferBytes),
+        "cudaMalloc deviceDelayValues (Fase 01)")) {
+        return false;
+    }
+
+    if (!reportCudaFailure(cudaMalloc(reinterpret_cast<void**>(&deviceValidMask), validMaskBytes),
+        "cudaMalloc deviceValidMask (Fase 01)")) {
+        releaseDeviceAllocation(deviceDelayValues);
+        return false;
+    }
+
+    if (!reportCudaFailure(cudaMemcpy(
+        deviceDelayValues,
+        depDelayValues.data(),
+        delayBufferBytes,
+        cudaMemcpyHostToDevice),
+        "cudaMemcpy H2D deviceDelayValues (Fase 01)")) {
+        releaseDeviceAllocation(deviceDelayValues);
+        releaseDeviceAllocation(deviceValidMask);
+        return false;
+    }
+
+    if (!reportCudaFailure(cudaMemcpy(
+        deviceValidMask,
+        depDelayValidMask.data(),
+        validMaskBytes,
+        cudaMemcpyHostToDevice),
+        "cudaMemcpy H2D deviceValidMask (Fase 01)")) {
+        releaseDeviceAllocation(deviceDelayValues);
+        releaseDeviceAllocation(deviceValidMask);
+        return false;
+    }
+
+    std::cout << "\nEjecutando Fase 01 en GPU...\n";
+
+    phase1DepartureDelayKernel<<<launchConfig.blocks, launchConfig.threadsPerBlock>>>(
+        deviceDelayValues,
+        deviceValidMask,
+        totalElements,
+        static_cast<int>(mode),
+        threshold);
+
+    // Primero comprobamos errores de lanzamiento y despues sincronizamos para
+    // vaciar los printf de GPU antes de volver al menu.
+    if (!reportCudaFailure(cudaGetLastError(), "lanzamiento phase1DepartureDelayKernel")) {
+        releaseDeviceAllocation(deviceDelayValues);
+        releaseDeviceAllocation(deviceValidMask);
+        return false;
+    }
+
+    if (!reportCudaFailure(cudaDeviceSynchronize(), "cudaDeviceSynchronize Fase 01")) {
+        releaseDeviceAllocation(deviceDelayValues);
+        releaseDeviceAllocation(deviceValidMask);
+        return false;
+    }
+
+    releaseDeviceAllocation(deviceDelayValues);
+    releaseDeviceAllocation(deviceValidMask);
+
+    return true;
+}
+
+/*
+    runPhase2Computation
+
+    Implementacion host de la Fase 02. Ademas del filtrado en GPU, esta fase
+    debe recuperar al host:
+
+    - el numero total de resultados;
+    - un array simple de retrasos;
+    - un array simple de matriculas.
+*/
+bool runPhase2Computation(const AppState& appState, DelayFilterMode mode, int threshold)
+{
+    const DatasetColumns& dataset = appState.loadResult.dataset;
+
+    std::vector<int> arrDelayValues;
+    std::vector<unsigned char> arrDelayValidMask;
+    std::vector<char> tailNumBuffer;
+
+    buildIntDelayBuffer(dataset.arrDelay, arrDelayValues, arrDelayValidMask);
+    buildTailNumFixedBuffer(dataset.tailNum, tailNumBuffer);
+
+    const int totalElements = static_cast<int>(arrDelayValues.size());
+
+    if (totalElements <= 0) {
+        std::cout << "No hay datos disponibles para ejecutar la Fase 02.\n";
+        return false;
+    }
+
+    const LaunchConfig launchConfig = computeLaunchConfig(totalElements, appState.deviceProp);
+
+    int* deviceDelayValues = nullptr;
+    unsigned char* deviceValidMask = nullptr;
+    char* deviceTailNumBuffer = nullptr;
+    int* deviceOutCount = nullptr;
+    int* deviceOutDelayValues = nullptr;
+    char* deviceOutTailNumBuffer = nullptr;
+
+    const std::size_t delayBufferBytes = arrDelayValues.size() * sizeof(int);
+    const std::size_t validMaskBytes = arrDelayValidMask.size() * sizeof(unsigned char);
+    const std::size_t tailNumBufferBytes = tailNumBuffer.size() * sizeof(char);
+
+    if (!reportCudaFailure(cudaMalloc(reinterpret_cast<void**>(&deviceDelayValues), delayBufferBytes),
+        "cudaMalloc deviceDelayValues (Fase 02)")) {
+        return false;
+    }
+
+    if (!reportCudaFailure(cudaMalloc(reinterpret_cast<void**>(&deviceValidMask), validMaskBytes),
+        "cudaMalloc deviceValidMask (Fase 02)")) {
+        releaseDeviceAllocation(deviceDelayValues);
+        return false;
+    }
+
+    if (!reportCudaFailure(cudaMalloc(reinterpret_cast<void**>(&deviceTailNumBuffer), tailNumBufferBytes),
+        "cudaMalloc deviceTailNumBuffer (Fase 02)")) {
+        releaseDeviceAllocation(deviceDelayValues);
+        releaseDeviceAllocation(deviceValidMask);
+        return false;
+    }
+
+    if (!reportCudaFailure(cudaMalloc(reinterpret_cast<void**>(&deviceOutCount), sizeof(int)),
+        "cudaMalloc deviceOutCount (Fase 02)")) {
+        releaseDeviceAllocation(deviceDelayValues);
+        releaseDeviceAllocation(deviceValidMask);
+        releaseDeviceAllocation(deviceTailNumBuffer);
+        return false;
+    }
+
+    if (!reportCudaFailure(cudaMalloc(reinterpret_cast<void**>(&deviceOutDelayValues), delayBufferBytes),
+        "cudaMalloc deviceOutDelayValues (Fase 02)")) {
+        releaseDeviceAllocation(deviceDelayValues);
+        releaseDeviceAllocation(deviceValidMask);
+        releaseDeviceAllocation(deviceTailNumBuffer);
+        releaseDeviceAllocation(deviceOutCount);
+        return false;
+    }
+
+    if (!reportCudaFailure(cudaMalloc(reinterpret_cast<void**>(&deviceOutTailNumBuffer), tailNumBufferBytes),
+        "cudaMalloc deviceOutTailNumBuffer (Fase 02)")) {
+        releaseDeviceAllocation(deviceDelayValues);
+        releaseDeviceAllocation(deviceValidMask);
+        releaseDeviceAllocation(deviceTailNumBuffer);
+        releaseDeviceAllocation(deviceOutCount);
+        releaseDeviceAllocation(deviceOutDelayValues);
+        return false;
+    }
+
+    if (!reportCudaFailure(cudaMemcpy(
+        deviceDelayValues,
+        arrDelayValues.data(),
+        delayBufferBytes,
+        cudaMemcpyHostToDevice),
+        "cudaMemcpy H2D deviceDelayValues (Fase 02)")) {
+        releaseDeviceAllocation(deviceDelayValues);
+        releaseDeviceAllocation(deviceValidMask);
+        releaseDeviceAllocation(deviceTailNumBuffer);
+        releaseDeviceAllocation(deviceOutCount);
+        releaseDeviceAllocation(deviceOutDelayValues);
+        releaseDeviceAllocation(deviceOutTailNumBuffer);
+        return false;
+    }
+
+    if (!reportCudaFailure(cudaMemcpy(
+        deviceValidMask,
+        arrDelayValidMask.data(),
+        validMaskBytes,
+        cudaMemcpyHostToDevice),
+        "cudaMemcpy H2D deviceValidMask (Fase 02)")) {
+        releaseDeviceAllocation(deviceDelayValues);
+        releaseDeviceAllocation(deviceValidMask);
+        releaseDeviceAllocation(deviceTailNumBuffer);
+        releaseDeviceAllocation(deviceOutCount);
+        releaseDeviceAllocation(deviceOutDelayValues);
+        releaseDeviceAllocation(deviceOutTailNumBuffer);
+        return false;
+    }
+
+    if (!reportCudaFailure(cudaMemcpy(
+        deviceTailNumBuffer,
+        tailNumBuffer.data(),
+        tailNumBufferBytes,
+        cudaMemcpyHostToDevice),
+        "cudaMemcpy H2D deviceTailNumBuffer (Fase 02)")) {
+        releaseDeviceAllocation(deviceDelayValues);
+        releaseDeviceAllocation(deviceValidMask);
+        releaseDeviceAllocation(deviceTailNumBuffer);
+        releaseDeviceAllocation(deviceOutCount);
+        releaseDeviceAllocation(deviceOutDelayValues);
+        releaseDeviceAllocation(deviceOutTailNumBuffer);
+        return false;
+    }
+
+    if (!reportCudaFailure(cudaMemset(deviceOutCount, 0, sizeof(int)),
+        "cudaMemset deviceOutCount (Fase 02)")) {
+        releaseDeviceAllocation(deviceDelayValues);
+        releaseDeviceAllocation(deviceValidMask);
+        releaseDeviceAllocation(deviceTailNumBuffer);
+        releaseDeviceAllocation(deviceOutCount);
+        releaseDeviceAllocation(deviceOutDelayValues);
+        releaseDeviceAllocation(deviceOutTailNumBuffer);
+        return false;
+    }
+
+    if (!reportCudaFailure(copyPhase2FilterConfigToConstant(static_cast<int>(mode), threshold),
+        "copyPhase2FilterConfigToConstant (Fase 02)")) {
+        releaseDeviceAllocation(deviceDelayValues);
+        releaseDeviceAllocation(deviceValidMask);
+        releaseDeviceAllocation(deviceTailNumBuffer);
+        releaseDeviceAllocation(deviceOutCount);
+        releaseDeviceAllocation(deviceOutDelayValues);
+        releaseDeviceAllocation(deviceOutTailNumBuffer);
+        return false;
+    }
+
+    std::cout << "\nEjecutando Fase 02 en GPU...\n";
+
+    phase2ArrivalDelayKernel<<<launchConfig.blocks, launchConfig.threadsPerBlock>>>(
+        deviceDelayValues,
+        deviceValidMask,
+        deviceTailNumBuffer,
+        totalElements,
+        deviceOutCount,
+        deviceOutDelayValues,
+        deviceOutTailNumBuffer);
+
+    if (!reportCudaFailure(cudaGetLastError(), "lanzamiento phase2ArrivalDelayKernel")) {
+        releaseDeviceAllocation(deviceDelayValues);
+        releaseDeviceAllocation(deviceValidMask);
+        releaseDeviceAllocation(deviceTailNumBuffer);
+        releaseDeviceAllocation(deviceOutCount);
+        releaseDeviceAllocation(deviceOutDelayValues);
+        releaseDeviceAllocation(deviceOutTailNumBuffer);
+        return false;
+    }
+
+    if (!reportCudaFailure(cudaDeviceSynchronize(), "cudaDeviceSynchronize Fase 02")) {
+        releaseDeviceAllocation(deviceDelayValues);
+        releaseDeviceAllocation(deviceValidMask);
+        releaseDeviceAllocation(deviceTailNumBuffer);
+        releaseDeviceAllocation(deviceOutCount);
+        releaseDeviceAllocation(deviceOutDelayValues);
+        releaseDeviceAllocation(deviceOutTailNumBuffer);
+        return false;
+    }
+
+    int resultCount = 0;
+
+    if (!reportCudaFailure(cudaMemcpy(
+        &resultCount,
+        deviceOutCount,
+        sizeof(int),
+        cudaMemcpyDeviceToHost),
+        "cudaMemcpy D2H deviceOutCount (Fase 02)")) {
+        releaseDeviceAllocation(deviceDelayValues);
+        releaseDeviceAllocation(deviceValidMask);
+        releaseDeviceAllocation(deviceTailNumBuffer);
+        releaseDeviceAllocation(deviceOutCount);
+        releaseDeviceAllocation(deviceOutDelayValues);
+        releaseDeviceAllocation(deviceOutTailNumBuffer);
+        return false;
+    }
+
+    std::vector<int> outDelayValues(static_cast<std::size_t>(resultCount));
+    std::vector<char> outTailNumBuffer(static_cast<std::size_t>(resultCount) * kPhase2TailNumStride, '\0');
+
+    // Copiamos solo la parte realmente usada de los arrays de salida.
+    if (resultCount > 0) {
+        if (!reportCudaFailure(cudaMemcpy(
+            outDelayValues.data(),
+            deviceOutDelayValues,
+            static_cast<std::size_t>(resultCount) * sizeof(int),
+            cudaMemcpyDeviceToHost),
+            "cudaMemcpy D2H deviceOutDelayValues (Fase 02)")) {
+            releaseDeviceAllocation(deviceDelayValues);
+            releaseDeviceAllocation(deviceValidMask);
+            releaseDeviceAllocation(deviceTailNumBuffer);
+            releaseDeviceAllocation(deviceOutCount);
+            releaseDeviceAllocation(deviceOutDelayValues);
+            releaseDeviceAllocation(deviceOutTailNumBuffer);
+            return false;
+        }
+
+        if (!reportCudaFailure(cudaMemcpy(
+            outTailNumBuffer.data(),
+            deviceOutTailNumBuffer,
+            static_cast<std::size_t>(resultCount) * kPhase2TailNumStride * sizeof(char),
+            cudaMemcpyDeviceToHost),
+            "cudaMemcpy D2H deviceOutTailNumBuffer (Fase 02)")) {
+            releaseDeviceAllocation(deviceDelayValues);
+            releaseDeviceAllocation(deviceValidMask);
+            releaseDeviceAllocation(deviceTailNumBuffer);
+            releaseDeviceAllocation(deviceOutCount);
+            releaseDeviceAllocation(deviceOutDelayValues);
+            releaseDeviceAllocation(deviceOutTailNumBuffer);
+            return false;
+        }
+    }
+
+    releaseDeviceAllocation(deviceDelayValues);
+    releaseDeviceAllocation(deviceValidMask);
+    releaseDeviceAllocation(deviceTailNumBuffer);
+    releaseDeviceAllocation(deviceOutCount);
+    releaseDeviceAllocation(deviceOutDelayValues);
+    releaseDeviceAllocation(deviceOutTailNumBuffer);
+
+    printPhase2HostSummary(mode, threshold, resultCount, outDelayValues, outTailNumBuffer);
+    return true;
 }
 
 /*
@@ -292,7 +824,7 @@ void printApplicationState(const AppState& appState)
 */
 bool loadDatasetIntoState(AppState& appState, const std::string& datasetPath)
 {
-    const CsvLoadResult newLoadResult = loadDataset(datasetPath);
+    CsvLoadResult newLoadResult = loadDataset(datasetPath);
 
     if (!newLoadResult.success) {
         std::cout << "\nNo se ha podido cargar el dataset.\n";
@@ -302,7 +834,7 @@ bool loadDatasetIntoState(AppState& appState, const std::string& datasetPath)
     }
 
     appState.datasetPath = datasetPath;
-    appState.loadResult = newLoadResult;
+    appState.loadResult = std::move(newLoadResult);
     appState.datasetLoaded = true;
 
     printLoadSummary(appState.loadResult);
@@ -367,13 +899,12 @@ void printSuggestedLaunchConfigIfAvailable(const AppState& appState)
 /*
     runPhase1Shell
 
-    Submenu de la Fase 01 en el estado actual del proyecto. Todavia no lanza
-    kernels, pero ya:
+    Submenu real de la Fase 01. Esta funcion:
 
-    - comprueba que haya dataset cargado;
-    - pide el umbral firmado;
-    - muestra la configuracion capturada;
-    - deja constancia de la futura configuracion CUDA sugerida.
+    - comprueba que haya dataset y GPU;
+    - pide tipo de filtro y umbral no negativo;
+    - resume la configuracion elegida;
+    - lanza la fase real en GPU.
 */
 void runPhase1Shell(const AppState& appState)
 {
@@ -385,26 +916,43 @@ void runPhase1Shell(const AppState& appState)
         return;
     }
 
+    if (!appState.deviceReady) {
+        std::cout << "No hay GPU CUDA disponible para ejecutar la Fase 01.\n";
+        std::cout << "Motivo: " << appState.deviceErrorMessage << "\n";
+        waitForEnter();
+        return;
+    }
+
+    DelayFilterMode filterMode = DelayFilterMode::Both;
     int threshold = 0;
 
-    if (!readSignedInt("Introduzca el umbral firmado (o X para volver): ", threshold)) {
+    if (!readDelayFilterModeOption("Seleccione el tipo de filtro (o X para volver): ", filterMode)) {
+        return;
+    }
+
+    if (!readBoundedIntOption("Introduzca el umbral (>= 0, o X para volver): ", 0, 2147483647, threshold)) {
         return;
     }
 
     std::cout << "\nConfiguracion capturada:\n";
     std::cout << "- Columna objetivo: DEP_DELAY\n";
+    std::cout << "- Tipo de filtro: " << getDelayFilterModeLabel(filterMode) << "\n";
     std::cout << "- Umbral: " << threshold << " minutos\n";
     printSuggestedLaunchConfigIfAvailable(appState);
-    printPhasePendingMessage("Fase 01");
+
+    if (!runPhase1Computation(appState, filterMode, threshold)) {
+        std::cout << "La Fase 01 no se ha podido completar correctamente.\n";
+    }
+
     waitForEnter();
 }
 
 /*
     runPhase2Shell
 
-    Equivalente de interfaz para la Fase 02. Igual que en la Fase 01, hoy solo
-    prepara la conversacion con el usuario y deja claro que la logica CUDA de
-    deteccion por ARR_DELAY y TAIL_NUM aun no esta integrada.
+    Submenu real de la Fase 02. Esta funcion recoge tipo de filtro y umbral,
+    resume la configuracion y ejecuta el flujo host/device que pide el
+    enunciado.
 */
 void runPhase2Shell(const AppState& appState)
 {
@@ -416,18 +964,35 @@ void runPhase2Shell(const AppState& appState)
         return;
     }
 
+    if (!appState.deviceReady) {
+        std::cout << "No hay GPU CUDA disponible para ejecutar la Fase 02.\n";
+        std::cout << "Motivo: " << appState.deviceErrorMessage << "\n";
+        waitForEnter();
+        return;
+    }
+
+    DelayFilterMode filterMode = DelayFilterMode::Both;
     int threshold = 0;
 
-    if (!readSignedInt("Introduzca el umbral firmado (o X para volver): ", threshold)) {
+    if (!readDelayFilterModeOption("Seleccione el tipo de filtro (o X para volver): ", filterMode)) {
+        return;
+    }
+
+    if (!readBoundedIntOption("Introduzca el umbral (>= 0, o X para volver): ", 0, 2147483647, threshold)) {
         return;
     }
 
     std::cout << "\nConfiguracion capturada:\n";
     std::cout << "- Columna objetivo: ARR_DELAY\n";
     std::cout << "- Columna auxiliar: TAIL_NUM\n";
+    std::cout << "- Tipo de filtro: " << getDelayFilterModeLabel(filterMode) << "\n";
     std::cout << "- Umbral: " << threshold << " minutos\n";
     printSuggestedLaunchConfigIfAvailable(appState);
-    printPhasePendingMessage("Fase 02");
+
+    if (!runPhase2Computation(appState, filterMode, threshold)) {
+        std::cout << "La Fase 02 no se ha podido completar correctamente.\n";
+    }
+
     waitForEnter();
 }
 

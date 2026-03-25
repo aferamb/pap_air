@@ -43,6 +43,14 @@ enum class HistogramAirportTypeOption {
     Destination = 2
 };
 
+// Tipo de filtro opcional para las Fases 01 y 02. Permite separar el concepto
+// de "modo de busqueda" del valor numerico del umbral.
+enum class DelayFilterMode {
+    Delay = 1,
+    Advance = 2,
+    Both = 3
+};
+
 // Muestra el encabezado general del programa al arrancar la aplicacion.
 void printApplicationBanner();
 
@@ -78,6 +86,15 @@ MainMenuOption readMainMenuOption();
     false para que el llamador pueda volver al menu anterior sin error.
 */
 bool readSignedInt(const std::string& prompt, int& value);
+
+/*
+    readDelayFilterModeOption
+
+    Lee el modo de filtrado de las Fases 01 y 02. Si el usuario pulsa Intro,
+    se interpreta como "ambos" para seguir la preferencia pedida en el flujo.
+    Si el usuario escribe X, devuelve false para volver al menu anterior.
+*/
+bool readDelayFilterModeOption(const std::string& prompt, DelayFilterMode& value);
 
 /*
     readBoundedIntOption
