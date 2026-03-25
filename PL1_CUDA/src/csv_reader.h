@@ -97,9 +97,17 @@ struct CsvLoadStats {
     std::size_t missingArrDelay = 0;
     std::size_t missingWeatherDelay = 0;
 
-    // Numero de codigos unicos detectados para origen y destino.
-    std::size_t uniqueOriginAirports = 0;
-    std::size_t uniqueDestinationAirports = 0;
+    // Numero de SEQ_ID unicos detectados para origen y destino. Este sera el
+    // criterio principal del estado inicial porque es el mismo que se usa en
+    // la Fase 04 para construir el histograma en GPU.
+    std::size_t uniqueOriginAirportSeqIds = 0;
+    std::size_t uniqueDestinationAirportSeqIds = 0;
+
+    // Numero de codigos textuales unicos detectados para origen y destino.
+    // Se conserva porque ayuda a explicar por que el dataset muestra 375
+    // codigos pero 409 SEQ_ID distintos.
+    std::size_t uniqueOriginAirportCodes = 0;
+    std::size_t uniqueDestinationAirportCodes = 0;
 };
 
 /*

@@ -13,6 +13,7 @@
     - Fase 02: deteccion de retrasos o adelantos en aterrizajes sobre
       ARR_DELAY + TAIL_NUM usando memoria constante y atomicas;
     - Fase 03: las cuatro variantes de reduccion pedidas en el enunciado.
+    - Fase 04: histograma de aeropuertos usando SEQ_ID densos.
 
     La idea es que main.cu pueda incluir este archivo y disponer de las
     declaraciones necesarias sin mezclar la implementacion CUDA dentro del
@@ -151,3 +152,43 @@ __global__ void reductionIntermediate(const int* data, int* result, int n, bool 
     falta hasta dejar 10 elementos o menos.
 */
 __global__ void reductionPattern(const int* input, int* output, int n, bool isMax);
+
+/*
+    phase4SharedHistogramKernel
+
+    Kernel principal recomendado para la Fase 04 cuando el numero de bins cabe
+    en memoria compartida. Cada bloque:
+
+    - inicializa su histograma compartido;
+    - procesa sus filas validas;
+    - vuelca su copia privada a un buffer global de parciales.
+*/
+__global__ void phase4SharedHistogramKernel(
+    const int* denseIndices,
+    int totalElements,
+    int totalBins,
+    unsigned int* partialHistograms);
+
+/*
+    phase4MergeHistogramKernel
+
+    Fusiona el buffer de histogramas parciales generado por
+    phase4SharedHistogramKernel y deja un unico histograma final en memoria
+    global.
+*/
+__global__ void phase4MergeHistogramKernel(
+    const unsigned int* partialHistograms,
+    int partialCount,
+    int totalBins,
+    unsigned int* finalHistogram);
+
+/*
+    phase4GlobalHistogramKernel
+
+    Ruta de respaldo simple para la Fase 04. Cada hilo procesa una fila valida
+    y aplica atomicAdd directamente sobre el histograma global final.
+*/
+__global__ void phase4GlobalHistogramKernel(
+    const int* denseIndices,
+    int totalElements,
+    unsigned int* finalHistogram);

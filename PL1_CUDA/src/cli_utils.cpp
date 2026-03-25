@@ -105,7 +105,7 @@ void printApplicationBanner()
 {
     std::cout << "========================================\n";
     std::cout << " PL1 CUDA - US Airline Dataset Toolkit\n";
-    std::cout << " Fases 0-3: carga y kernels principales\n";
+    std::cout << " Fases 0-4: practica completa conectada\n";
     std::cout << "========================================\n";
 }
 
@@ -161,6 +161,7 @@ void printPhase4Menu()
 {
     std::cout << "\n=== Fase 04 - Histograma de aeropuertos ===\n";
     std::cout << "Se pedira origen/destino y umbral minimo.\n";
+    std::cout << "La GPU trabajara con SEQ_ID y la CPU mostrara el codigo del aeropuerto.\n";
 }
 
 /*

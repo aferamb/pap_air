@@ -310,10 +310,17 @@ CsvLoadResult loadDataset(const std::string& filename)
         return result;
     }
 
-    // Estos conjuntos sirven para medir el numero de aeropuertos distintos
-    // detectados mientras recorremos el dataset una sola vez.
-    std::unordered_set<std::string> uniqueOriginAirports;
-    std::unordered_set<std::string> uniqueDestinationAirports;
+    // Estos conjuntos sirven para medir, en una sola pasada:
+    //
+    // - cuantos SEQ_ID distintos aparecen;
+    // - cuantos codigos textuales distintos aparecen.
+    //
+    // Ambos datos son utiles porque el dataset real tiene 375 codigos, pero
+    // 409 SEQ_ID unicos. La Fase 04 trabajara con SEQ_ID.
+    std::unordered_set<int> uniqueOriginAirportSeqIds;
+    std::unordered_set<int> uniqueDestinationAirportSeqIds;
+    std::unordered_set<std::string> uniqueOriginAirportCodes;
+    std::unordered_set<std::string> uniqueDestinationAirportCodes;
 
     std::string line;
     DatasetColumns& dataset = result.dataset;
@@ -343,6 +350,8 @@ CsvLoadResult loadDataset(const std::string& filename)
         int originSeqId = -1;
         if (!parseIntFromFloatToken(fields[IDX_ORIGIN_SEQ_ID], originSeqId)) {
             ++stats.missingOriginSeqId;
+        } else {
+            uniqueOriginAirportSeqIds.insert(originSeqId);
         }
         dataset.originSeqId.push_back(originSeqId);
 
@@ -351,7 +360,7 @@ CsvLoadResult loadDataset(const std::string& filename)
         if (originAirport.empty()) {
             ++stats.missingOriginAirport;
         } else {
-            uniqueOriginAirports.insert(originAirport);
+            uniqueOriginAirportCodes.insert(originAirport);
         }
         dataset.originAirport.push_back(originAirport);
 
@@ -359,6 +368,8 @@ CsvLoadResult loadDataset(const std::string& filename)
         int destSeqId = -1;
         if (!parseIntFromFloatToken(fields[IDX_DEST_SEQ_ID], destSeqId)) {
             ++stats.missingDestSeqId;
+        } else {
+            uniqueDestinationAirportSeqIds.insert(destSeqId);
         }
         dataset.destSeqId.push_back(destSeqId);
 
@@ -367,7 +378,7 @@ CsvLoadResult loadDataset(const std::string& filename)
         if (destAirport.empty()) {
             ++stats.missingDestAirport;
         } else {
-            uniqueDestinationAirports.insert(destAirport);
+            uniqueDestinationAirportCodes.insert(destAirport);
         }
         dataset.destAirport.push_back(destAirport);
 
@@ -400,9 +411,12 @@ CsvLoadResult loadDataset(const std::string& filename)
         ++stats.storedRows;
     }
 
-    // Guardamos el total de codigos unicos detectados durante la lectura.
-    stats.uniqueOriginAirports = uniqueOriginAirports.size();
-    stats.uniqueDestinationAirports = uniqueDestinationAirports.size();
+    // Guardamos ambas metricas para que la CLI pueda explicar la diferencia
+    // entre contar por codigo textual y contar por SEQ_ID.
+    stats.uniqueOriginAirportSeqIds = uniqueOriginAirportSeqIds.size();
+    stats.uniqueDestinationAirportSeqIds = uniqueDestinationAirportSeqIds.size();
+    stats.uniqueOriginAirportCodes = uniqueOriginAirportCodes.size();
+    stats.uniqueDestinationAirportCodes = uniqueDestinationAirportCodes.size();
 
     // No tiene sentido dar por valida una carga que no produce ni una fila.
     if (stats.storedRows == 0) {

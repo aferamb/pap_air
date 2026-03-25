@@ -4,6 +4,7 @@
 #include <cmath>
 #include <iostream>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -19,8 +20,9 @@
 
     - la Fase 0 de lectura y limpieza;
     - la Fase 01 de retraso en despegues;
-    - la Fase 02 de retraso en aterrizajes.
+    - la Fase 02 de retraso en aterrizajes;
     - la Fase 03 de reduccion de retrasos.
+    - la Fase 04 de histograma de aeropuertos.
 
     Flujo general actual:
 
@@ -29,9 +31,8 @@
     3. pedir la ruta del CSV y cargarlo;
     4. mostrar resumen de la limpieza y del hardware;
     5. entrar en un menu principal persistente;
-    6. permitir ejecutar las fases 01, 02 y 03;
-    7. dejar preparada la fase 04;
-    8. permitir recargar el dataset y consultar el estado.
+    6. permitir ejecutar las fases 01, 02, 03 y 04;
+    7. permitir recargar el dataset y consultar el estado.
 
     La CPU se encarga de:
 
@@ -41,8 +42,8 @@
     - recuperar resultados cuando la fase lo exige.
 
     La GPU se usa ya en las fases 01 y 02 para realizar el filtrado pedido por
-    el enunciado, y tambien en la Fase 03 para ejecutar sus cuatro variantes
-    de reduccion.
+    el enunciado, en la Fase 03 para ejecutar sus cuatro variantes de
+    reduccion y en la Fase 04 para generar el histograma de aeropuertos.
 */
 
 /*
@@ -923,6 +924,442 @@ bool runPhase3Computation(
 }
 
 /*
+    selectPhase4SeqIdColumn
+
+    Devuelve la columna de SEQ_ID que la Fase 04 debe usar como categoria
+    numerica principal en GPU.
+*/
+const std::vector<int>& selectPhase4SeqIdColumn(
+    const DatasetColumns& dataset,
+    HistogramAirportTypeOption airportType)
+{
+    if (airportType == HistogramAirportTypeOption::Origin) {
+        return dataset.originSeqId;
+    }
+
+    return dataset.destSeqId;
+}
+
+/*
+    selectPhase4CodeColumn
+
+    Devuelve la columna textual que se usara solo en CPU para mostrar el codigo
+    del aeropuerto asociado a cada SEQ_ID.
+*/
+const std::vector<std::string>& selectPhase4CodeColumn(
+    const DatasetColumns& dataset,
+    HistogramAirportTypeOption airportType)
+{
+    if (airportType == HistogramAirportTypeOption::Origin) {
+        return dataset.originAirport;
+    }
+
+    return dataset.destAirport;
+}
+
+/*
+    getPhase4AirportLabel
+
+    Etiqueta legible del tipo de aeropuerto elegido por el usuario.
+*/
+const char* getPhase4AirportLabel(HistogramAirportTypeOption airportType)
+{
+    if (airportType == HistogramAirportTypeOption::Origin) {
+        return "origen";
+    }
+
+    return "destino";
+}
+
+/*
+    buildPhase4DenseInput
+
+    Convierte los SEQ_ID reales del dataset en indices densos consecutivos que
+    la GPU pueda usar como bins sencillos del histograma.
+
+    La funcion mantiene:
+
+    - seqIdToDenseIndex: para saber que bin corresponde a cada SEQ_ID;
+    - seqIdToCode: para traducir despues el resultado a un codigo legible;
+    - denseToSeqId: para recorrer los bins en el mismo orden de descubrimiento;
+    - denseInput: vector lineal listo para copiar a GPU.
+*/
+void buildPhase4DenseInput(
+    const std::vector<int>& seqIdColumn,
+    const std::vector<std::string>& codeColumn,
+    std::unordered_map<int, int>& seqIdToDenseIndex,
+    std::unordered_map<int, std::string>& seqIdToCode,
+    std::vector<int>& denseToSeqId,
+    std::vector<int>& denseInput)
+{
+    seqIdToDenseIndex.clear();
+    seqIdToCode.clear();
+    denseToSeqId.clear();
+    denseInput.clear();
+    denseInput.reserve(seqIdColumn.size());
+
+    for (std::size_t i = 0; i < seqIdColumn.size(); ++i) {
+        const int seqId = seqIdColumn[i];
+        const std::string& airportCode = codeColumn[i];
+
+        // Si falta el ID o el codigo, no podemos ni contar correctamente en
+        // GPU ni mostrar el resultado final en consola.
+        if (seqId < 0 || airportCode.empty()) {
+            continue;
+        }
+
+        const int nextDenseIndex = static_cast<int>(denseToSeqId.size());
+        const std::pair<std::unordered_map<int, int>::iterator, bool> insertResult =
+            seqIdToDenseIndex.insert(std::make_pair(seqId, nextDenseIndex));
+
+        if (insertResult.second) {
+            denseToSeqId.push_back(seqId);
+            seqIdToCode[seqId] = airportCode;
+        }
+
+        denseInput.push_back(insertResult.first->second);
+    }
+}
+
+/*
+    printPhase4Histogram
+
+    Dibuja en CPU el histograma textual final. El orden de salida respeta el
+    orden de descubrimiento del dataset, tal como se ha fijado para esta fase.
+*/
+void printPhase4Histogram(
+    HistogramAirportTypeOption airportType,
+    int threshold,
+    const std::vector<unsigned int>& histogram,
+    const std::vector<int>& denseToSeqId,
+    const std::unordered_map<int, std::string>& seqIdToCode)
+{
+    const unsigned int minimumCount = static_cast<unsigned int>(threshold);
+    unsigned int maximumShownCount = 0;
+    int shownAirports = 0;
+
+    for (std::size_t i = 0; i < histogram.size(); ++i) {
+        if (histogram[i] >= minimumCount) {
+            ++shownAirports;
+
+            if (histogram[i] > maximumShownCount) {
+                maximumShownCount = histogram[i];
+            }
+        }
+    }
+
+    std::cout << "\n(4) Histograma de aeropuertos de "
+              << getPhase4AirportLabel(airportType)
+              << "\n\n";
+    std::cout << "Num de aeropuertos encontrados: " << denseToSeqId.size() << "\n\n";
+
+    for (std::size_t denseIndex = 0; denseIndex < histogram.size(); ++denseIndex) {
+        const unsigned int airportCount = histogram[denseIndex];
+
+        if (airportCount < minimumCount) {
+            continue;
+        }
+
+        const int seqId = denseToSeqId[denseIndex];
+        std::string airportCode;
+
+        const std::unordered_map<int, std::string>::const_iterator codeIt = seqIdToCode.find(seqId);
+        if (codeIt != seqIdToCode.end()) {
+            airportCode = codeIt->second;
+        }
+
+        std::cout << airportCode << " (" << seqId << ") | " << airportCount << " ";
+
+        const int kMaxBarWidth = 40;
+        int barLength = 0;
+
+        if (maximumShownCount > 0) {
+            barLength = static_cast<int>(
+                (static_cast<unsigned long long>(airportCount) * static_cast<unsigned long long>(kMaxBarWidth))
+                / static_cast<unsigned long long>(maximumShownCount));
+        }
+
+        if (barLength <= 0 && airportCount > 0) {
+            barLength = 1;
+        }
+
+        for (int i = 0; i < barLength; ++i) {
+            std::cout << '#';
+        }
+
+        std::cout << "\n";
+    }
+
+    std::cout << "\nAeropuertos mostrados (con al menos "
+              << threshold
+              << " vuelos): "
+              << shownAirports
+              << " (del total "
+              << denseToSeqId.size()
+              << ")\n";
+}
+
+/*
+    runPhase4SharedHistogram
+
+    Variante principal de la Fase 04. Genera un histograma parcial por bloque
+    en memoria compartida y despues lo fusiona en un segundo kernel global.
+*/
+bool runPhase4SharedHistogram(
+    int* deviceDenseInput,
+    int totalElements,
+    int totalBins,
+    const LaunchConfig& launchConfig,
+    const cudaDeviceProp& deviceProp,
+    std::vector<unsigned int>& outHistogram)
+{
+    unsigned int* devicePartialHistograms = nullptr;
+    unsigned int* deviceFinalHistogram = nullptr;
+
+    const std::size_t histogramBytes = static_cast<std::size_t>(totalBins) * sizeof(unsigned int);
+    const std::size_t partialHistogramBytes =
+        static_cast<std::size_t>(launchConfig.blocks) * static_cast<std::size_t>(totalBins) * sizeof(unsigned int);
+    const std::size_t sharedBytes = static_cast<std::size_t>(totalBins) * sizeof(unsigned int);
+
+    if (!reportCudaFailure(cudaMalloc(reinterpret_cast<void**>(&devicePartialHistograms), partialHistogramBytes),
+        "cudaMalloc devicePartialHistograms (Fase 04)")) {
+        return false;
+    }
+
+    if (!reportCudaFailure(cudaMalloc(reinterpret_cast<void**>(&deviceFinalHistogram), histogramBytes),
+        "cudaMalloc deviceFinalHistogram (Fase 04)")) {
+        releaseDeviceAllocation(devicePartialHistograms);
+        return false;
+    }
+
+    if (!reportCudaFailure(cudaMemset(deviceFinalHistogram, 0, histogramBytes),
+        "cudaMemset deviceFinalHistogram (Fase 04)")) {
+        releaseDeviceAllocation(devicePartialHistograms);
+        releaseDeviceAllocation(deviceFinalHistogram);
+        return false;
+    }
+
+    phase4SharedHistogramKernel<<<launchConfig.blocks, launchConfig.threadsPerBlock, sharedBytes>>>(
+        deviceDenseInput,
+        totalElements,
+        totalBins,
+        devicePartialHistograms);
+
+    if (!reportCudaFailure(cudaGetLastError(), "lanzamiento phase4SharedHistogramKernel")) {
+        releaseDeviceAllocation(devicePartialHistograms);
+        releaseDeviceAllocation(deviceFinalHistogram);
+        return false;
+    }
+
+    if (!reportCudaFailure(cudaDeviceSynchronize(), "cudaDeviceSynchronize phase4SharedHistogramKernel")) {
+        releaseDeviceAllocation(devicePartialHistograms);
+        releaseDeviceAllocation(deviceFinalHistogram);
+        return false;
+    }
+
+    const LaunchConfig mergeLaunchConfig = computeLaunchConfig(totalBins, deviceProp);
+
+    phase4MergeHistogramKernel<<<mergeLaunchConfig.blocks, mergeLaunchConfig.threadsPerBlock>>>(
+        devicePartialHistograms,
+        launchConfig.blocks,
+        totalBins,
+        deviceFinalHistogram);
+
+    if (!reportCudaFailure(cudaGetLastError(), "lanzamiento phase4MergeHistogramKernel")) {
+        releaseDeviceAllocation(devicePartialHistograms);
+        releaseDeviceAllocation(deviceFinalHistogram);
+        return false;
+    }
+
+    if (!reportCudaFailure(cudaDeviceSynchronize(), "cudaDeviceSynchronize phase4MergeHistogramKernel")) {
+        releaseDeviceAllocation(devicePartialHistograms);
+        releaseDeviceAllocation(deviceFinalHistogram);
+        return false;
+    }
+
+    outHistogram.assign(static_cast<std::size_t>(totalBins), 0U);
+
+    if (!reportCudaFailure(cudaMemcpy(
+        outHistogram.data(),
+        deviceFinalHistogram,
+        histogramBytes,
+        cudaMemcpyDeviceToHost),
+        "cudaMemcpy D2H deviceFinalHistogram (Fase 04)")) {
+        releaseDeviceAllocation(devicePartialHistograms);
+        releaseDeviceAllocation(deviceFinalHistogram);
+        return false;
+    }
+
+    releaseDeviceAllocation(devicePartialHistograms);
+    releaseDeviceAllocation(deviceFinalHistogram);
+    return true;
+}
+
+/*
+    runPhase4GlobalHistogram
+
+    Ruta de respaldo cuando el numero de bins no cabe en memoria compartida.
+    Es mas simple: un hilo por fila y atomicAdd directo sobre el histograma
+    global final.
+*/
+bool runPhase4GlobalHistogram(
+    int* deviceDenseInput,
+    int totalElements,
+    int totalBins,
+    const LaunchConfig& launchConfig,
+    std::vector<unsigned int>& outHistogram)
+{
+    unsigned int* deviceFinalHistogram = nullptr;
+    const std::size_t histogramBytes = static_cast<std::size_t>(totalBins) * sizeof(unsigned int);
+
+    if (!reportCudaFailure(cudaMalloc(reinterpret_cast<void**>(&deviceFinalHistogram), histogramBytes),
+        "cudaMalloc deviceFinalHistogram (Fase 04)")) {
+        return false;
+    }
+
+    if (!reportCudaFailure(cudaMemset(deviceFinalHistogram, 0, histogramBytes),
+        "cudaMemset deviceFinalHistogram (Fase 04)")) {
+        releaseDeviceAllocation(deviceFinalHistogram);
+        return false;
+    }
+
+    phase4GlobalHistogramKernel<<<launchConfig.blocks, launchConfig.threadsPerBlock>>>(
+        deviceDenseInput,
+        totalElements,
+        deviceFinalHistogram);
+
+    if (!reportCudaFailure(cudaGetLastError(), "lanzamiento phase4GlobalHistogramKernel")) {
+        releaseDeviceAllocation(deviceFinalHistogram);
+        return false;
+    }
+
+    if (!reportCudaFailure(cudaDeviceSynchronize(), "cudaDeviceSynchronize phase4GlobalHistogramKernel")) {
+        releaseDeviceAllocation(deviceFinalHistogram);
+        return false;
+    }
+
+    outHistogram.assign(static_cast<std::size_t>(totalBins), 0U);
+
+    if (!reportCudaFailure(cudaMemcpy(
+        outHistogram.data(),
+        deviceFinalHistogram,
+        histogramBytes,
+        cudaMemcpyDeviceToHost),
+        "cudaMemcpy D2H deviceFinalHistogram (Fase 04)")) {
+        releaseDeviceAllocation(deviceFinalHistogram);
+        return false;
+    }
+
+    releaseDeviceAllocation(deviceFinalHistogram);
+    return true;
+}
+
+/*
+    runPhase4Computation
+
+    Orquesta la Fase 04 completa:
+
+    1. selecciona origen o destino;
+    2. construye bins densos en host a partir de SEQ_ID;
+    3. decide si usa memoria compartida o histograma global directo;
+    4. lanza los kernels necesarios;
+    5. recupera y dibuja el histograma en CPU.
+*/
+bool runPhase4Computation(
+    const AppState& appState,
+    HistogramAirportTypeOption airportType,
+    int threshold)
+{
+    const DatasetColumns& dataset = appState.loadResult.dataset;
+    const std::vector<int>& seqIdColumn = selectPhase4SeqIdColumn(dataset, airportType);
+    const std::vector<std::string>& codeColumn = selectPhase4CodeColumn(dataset, airportType);
+
+    std::unordered_map<int, int> seqIdToDenseIndex;
+    std::unordered_map<int, std::string> seqIdToCode;
+    std::vector<int> denseToSeqId;
+    std::vector<int> denseInput;
+
+    buildPhase4DenseInput(
+        seqIdColumn,
+        codeColumn,
+        seqIdToDenseIndex,
+        seqIdToCode,
+        denseToSeqId,
+        denseInput);
+
+    const int totalElements = static_cast<int>(denseInput.size());
+    const int totalBins = static_cast<int>(denseToSeqId.size());
+
+    if (totalElements <= 0 || totalBins <= 0) {
+        std::cout << "No hay datos validos para construir el histograma de la Fase 04.\n";
+        return false;
+    }
+
+    const LaunchConfig launchConfig = computeLaunchConfig(totalElements, appState.deviceProp);
+    const std::size_t sharedHistogramBytes = static_cast<std::size_t>(totalBins) * sizeof(unsigned int);
+    const bool useSharedHistogram =
+        sharedHistogramBytes <= static_cast<std::size_t>(appState.deviceProp.sharedMemPerBlock);
+
+    std::cout << "- Filas validas para el histograma: " << totalElements << "\n";
+    std::cout << "- Aeropuertos unicos por SEQ_ID: " << totalBins << "\n";
+    std::cout << "- Configuracion usada: "
+              << launchConfig.blocks << " bloques x "
+              << launchConfig.threadsPerBlock << " hilos\n";
+    std::cout << "- Estrategia usada: "
+              << (useSharedHistogram
+                  ? "histograma compartido por bloque y fusion global"
+                  : "histograma global directo con atomicas")
+              << "\n";
+
+    int* deviceDenseInput = nullptr;
+    const std::size_t denseInputBytes = denseInput.size() * sizeof(int);
+
+    if (!reportCudaFailure(cudaMalloc(reinterpret_cast<void**>(&deviceDenseInput), denseInputBytes),
+        "cudaMalloc deviceDenseInput (Fase 04)")) {
+        return false;
+    }
+
+    if (!reportCudaFailure(cudaMemcpy(
+        deviceDenseInput,
+        denseInput.data(),
+        denseInputBytes,
+        cudaMemcpyHostToDevice),
+        "cudaMemcpy H2D deviceDenseInput (Fase 04)")) {
+        releaseDeviceAllocation(deviceDenseInput);
+        return false;
+    }
+
+    std::vector<unsigned int> histogram;
+    bool histogramBuilt = false;
+
+    if (useSharedHistogram) {
+        histogramBuilt = runPhase4SharedHistogram(
+            deviceDenseInput,
+            totalElements,
+            totalBins,
+            launchConfig,
+            appState.deviceProp,
+            histogram);
+    } else {
+        histogramBuilt = runPhase4GlobalHistogram(
+            deviceDenseInput,
+            totalElements,
+            totalBins,
+            launchConfig,
+            histogram);
+    }
+
+    releaseDeviceAllocation(deviceDenseInput);
+
+    if (!histogramBuilt) {
+        return false;
+    }
+
+    printPhase4Histogram(airportType, threshold, histogram, denseToSeqId, seqIdToCode);
+    return true;
+}
+
+/*
     runPhase1Computation
 
     Implementacion host de la Fase 01. Su responsabilidad es preparar buffers
@@ -1272,7 +1709,7 @@ bool runPhase2Computation(const AppState& appState, DelayFilterMode mode, int th
     - cuantas se han almacenado;
     - cuantas se han descartado;
     - cuantos faltantes hay por columna;
-    - cuantas categorias unicas se han encontrado.
+    - cuantas categorias unicas se han encontrado por SEQ_ID y por codigo.
 */
 void printLoadSummary(const CsvLoadResult& loadResult)
 {
@@ -1298,8 +1735,10 @@ void printLoadSummary(const CsvLoadResult& loadResult)
     std::cout << "- WEATHER_DELAY: " << stats.missingWeatherDelay << "\n";
 
     std::cout << "\nCategorias detectadas:\n";
-    std::cout << "- Aeropuertos unicos de origen: " << stats.uniqueOriginAirports << "\n";
-    std::cout << "- Aeropuertos unicos de destino: " << stats.uniqueDestinationAirports << "\n";
+    std::cout << "- Aeropuertos unicos de origen por SEQ_ID: " << stats.uniqueOriginAirportSeqIds << "\n";
+    std::cout << "- Aeropuertos unicos de destino por SEQ_ID: " << stats.uniqueDestinationAirportSeqIds << "\n";
+    std::cout << "- Aeropuertos unicos de origen por codigo: " << stats.uniqueOriginAirportCodes << "\n";
+    std::cout << "- Aeropuertos unicos de destino por codigo: " << stats.uniqueDestinationAirportCodes << "\n";
 }
 
 /*
@@ -1606,12 +2045,12 @@ void runPhase3Shell(const AppState& appState)
 /*
     runPhase4Shell
 
-    Prepara la interfaz de la Fase 04:
+    Submenu real de la Fase 04:
 
     - pide si el histograma sera de origen o destino;
     - pide el umbral minimo;
     - resume la configuracion seleccionada;
-    - deja indicada la estrategia prevista basada en IDs y no en strings GPU.
+    - ejecuta el histograma real basado en SEQ_ID.
 */
 void runPhase4Shell(const AppState& appState)
 {
@@ -1619,6 +2058,13 @@ void runPhase4Shell(const AppState& appState)
 
     if (!appState.datasetLoaded) {
         std::cout << "No hay dataset cargado. Cargue un CSV antes de continuar.\n";
+        waitForEnter();
+        return;
+    }
+
+    if (!appState.deviceReady) {
+        std::cout << "No hay GPU CUDA disponible para ejecutar la Fase 04.\n";
+        std::cout << "Motivo: " << appState.deviceErrorMessage << "\n";
         waitForEnter();
         return;
     }
@@ -1637,15 +2083,18 @@ void runPhase4Shell(const AppState& appState)
         return;
     }
 
-    const char* airportLabel =
-        airportType == static_cast<int>(HistogramAirportTypeOption::Origin) ? "ORIGIN" : "DEST";
+    const HistogramAirportTypeOption selectedAirportType =
+        static_cast<HistogramAirportTypeOption>(airportType);
 
     std::cout << "\nConfiguracion capturada:\n";
-    std::cout << "- Tipo de aeropuerto: " << airportLabel << "\n";
+    std::cout << "- Tipo de aeropuerto: " << getPhase4AirportLabel(selectedAirportType) << "\n";
     std::cout << "- Umbral minimo de ocurrencias: " << threshold << "\n";
     std::cout << "- Estrategia prevista: histograma por IDs de aeropuerto, no por strings directos\n";
-    printSuggestedLaunchConfigIfAvailable(appState);
-    printPhasePendingMessage("Fase 04");
+
+    if (!runPhase4Computation(appState, selectedAirportType, threshold)) {
+        std::cout << "La Fase 04 no se ha podido completar correctamente.\n";
+    }
+
     waitForEnter();
 }
 

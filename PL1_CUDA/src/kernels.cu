@@ -487,3 +487,93 @@ __global__ void reductionPattern(const int* input, int* output, int n, bool isMa
         output[blockIdx.x] = sharedReduction[0];
     }
 }
+
+/*
+    phase4SharedHistogramKernel
+
+    Cada bloque mantiene una copia privada del histograma en memoria
+    compartida. Esto reduce la contencion respecto a hacer todas las atomicas
+    directamente sobre memoria global.
+*/
+__global__ void phase4SharedHistogramKernel(
+    const int* denseIndices,
+    int totalElements,
+    int totalBins,
+    unsigned int* partialHistograms)
+{
+    extern __shared__ unsigned int sharedHistogram[];
+
+    const int globalIndex = blockIdx.x * blockDim.x + threadIdx.x;
+    const int localIndex = threadIdx.x;
+
+    // Como puede haber mas bins que hilos por bloque, inicializamos la zona
+    // compartida por tramos.
+    for (int bin = localIndex; bin < totalBins; bin += blockDim.x) {
+        sharedHistogram[bin] = 0;
+    }
+
+    __syncthreads();
+
+    if (globalIndex < totalElements) {
+        const int denseIndex = denseIndices[globalIndex];
+        atomicAdd(&sharedHistogram[denseIndex], 1U);
+    }
+
+    __syncthreads();
+
+    // Volcamos el histograma privado del bloque a la matriz global de
+    // parciales. Cada bloque escribe una fila completa de totalBins columnas.
+    unsigned int* blockPartialHistogram = partialHistograms + blockIdx.x * totalBins;
+
+    for (int bin = localIndex; bin < totalBins; bin += blockDim.x) {
+        blockPartialHistogram[bin] = sharedHistogram[bin];
+    }
+}
+
+/*
+    phase4MergeHistogramKernel
+
+    Cada hilo fusiona un bin del histograma final sumando el mismo bin de todos
+    los bloques parciales generados en la primera pasada.
+*/
+__global__ void phase4MergeHistogramKernel(
+    const unsigned int* partialHistograms,
+    int partialCount,
+    int totalBins,
+    unsigned int* finalHistogram)
+{
+    const int binIndex = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (binIndex >= totalBins) {
+        return;
+    }
+
+    unsigned int totalCount = 0;
+
+    for (int partialIndex = 0; partialIndex < partialCount; ++partialIndex) {
+        totalCount += partialHistograms[partialIndex * totalBins + binIndex];
+    }
+
+    finalHistogram[binIndex] = totalCount;
+}
+
+/*
+    phase4GlobalHistogramKernel
+
+    Variante de respaldo cuando el histograma compartido no cabe en memoria
+    compartida. Es mas simple, pero genera mas contencion en memoria global.
+*/
+__global__ void phase4GlobalHistogramKernel(
+    const int* denseIndices,
+    int totalElements,
+    unsigned int* finalHistogram)
+{
+    const int globalIndex = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (globalIndex >= totalElements) {
+        return;
+    }
+
+    const int denseIndex = denseIndices[globalIndex];
+    atomicAdd(&finalHistogram[denseIndex], 1U);
+}

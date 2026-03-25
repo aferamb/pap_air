@@ -4,8 +4,8 @@
 
 Este repositorio contiene una practica academica de **CUDA C/C++** basada en el
 **US Airline Dataset**. En el estado actual del codigo, las partes realmente
-implementadas son la **Fase 0**, la **Fase 01**, la **Fase 02** y la
-**Fase 03**:
+implementadas son la **Fase 0**, la **Fase 01**, la **Fase 02**, la
+**Fase 03** y la **Fase 04**:
 
 - lectura del CSV desde disco;
 - limpieza basica y validacion de cabecera;
@@ -16,9 +16,9 @@ implementadas son la **Fase 0**, la **Fase 01**, la **Fase 02** y la
 - filtrado CUDA de `DEP_DELAY` para la Fase 01;
 - filtrado CUDA de `ARR_DELAY` + `TAIL_NUM` para la Fase 02;
 - reducciones CUDA de maximo/minimo sobre `DEP_DELAY`, `ARR_DELAY` y
-  `WEATHER_DELAY` para la Fase 03.
-
-La **Fase 04** sigue teniendo solo el flujo de menu preparado.
+  `WEATHER_DELAY` para la Fase 03;
+- histograma CUDA de aeropuertos sobre `ORIGIN_SEQ_ID` y `DEST_SEQ_ID` para la
+  Fase 04.
 
 ---
 
@@ -44,7 +44,7 @@ El proyecto principal es `PL1_CUDA` y los archivos mas importantes son:
 - `PL1_CUDA/src/cli_utils.cpp`
   - implementa menus, lectura segura de opciones y pausas entre pantallas.
 - `PL1_CUDA/src/kernels.cuh`
-  - declara los kernels de Fase 01, Fase 02 y Fase 03.
+  - declara los kernels de Fase 01, Fase 02, Fase 03 y Fase 04.
 - `PL1_CUDA/src/kernels.cu`
   - implementa los kernels CUDA actuales del proyecto.
 - `PL1_CUDA/cuda.local.props.example`
@@ -122,15 +122,15 @@ Cuando se ejecuta el programa, el flujo actual es este:
     host, lanza el kernel y muestra los resultados.
 11. Si el usuario entra en Fase 03, la aplicacion compacta la columna elegida,
     la copia a GPU y ejecuta las cuatro variantes de reduccion.
-12. Si el usuario entra en Fase 04, la CLI sigue recogiendo los parametros,
-    pero esa fase aun esta pendiente.
+12. Si el usuario entra en Fase 04, la aplicacion construye bins densos a
+    partir de `SEQ_ID`, genera el histograma en GPU y lo dibuja en CPU.
 
 En otras palabras:
 
 - la **CPU** gestiona lectura, limpieza, validacion, estado, menus y
   preparacion de buffers;
-- la **GPU** ya ejecuta los kernels de Fase 01, Fase 02 y Fase 03;
-- la Fase 04 sigue siendo la unica fase obligatoria aun no conectada.
+- la **GPU** ya ejecuta los kernels de Fase 01, Fase 02, Fase 03 y Fase 04;
+- la CPU sigue encargandose de la carga del CSV y del postprocesado final.
 
 ---
 
@@ -192,7 +192,7 @@ CsvLoadResult loadDataset(const std::string& filename);
    - actualiza contadores de faltantes;
    - almacena la fila en `DatasetColumns`.
 8. Al final:
-   - calcula el numero de aeropuertos unicos;
+   - calcula el numero de aeropuertos unicos por `SEQ_ID` y por codigo;
    - verifica que todas las columnas tengan el mismo tamano;
    - devuelve un `CsvLoadResult`.
 
@@ -215,10 +215,22 @@ CsvLoadResult loadDataset(const std::string& filename);
 ### Estructuras de apoyo del lector
 
 - `CsvLoadStats`
-  - guarda filas leidas, filas almacenadas, filas descartadas y faltantes.
+  - guarda filas leidas, filas almacenadas, filas descartadas, faltantes y
+    conteos de aeropuertos por `SEQ_ID` y por codigo.
 - `CsvLoadResult`
   - agrupa el dataset, las estadisticas, la ruta procesada y un mensaje de
     error si algo falla.
+
+### Aclaracion importante sobre los aeropuertos unicos
+
+El dataset real da dos cifras distintas y ambas son correctas:
+
+- `375` codigos de aeropuerto unicos;
+- `409` `SEQ_ID` unicos.
+
+La diferencia existe porque hay codigos como `ORD`, `DAL` o `BZN` que aparecen
+con mas de un `SEQ_ID`. La Fase 04 trabaja con `SEQ_ID`, por eso el criterio
+principal del estado inicial pasa a ser `409`.
 
 ---
 
@@ -292,7 +304,7 @@ Comportamiento actual de los submenus:
 - Fase 03
   - ejecuta las cuatro variantes obligatorias de reduccion.
 - Fase 04
-  - sigue pendiente.
+  - ejecuta el histograma de aeropuertos usando `SEQ_ID` densos en GPU.
 
 ---
 
@@ -346,7 +358,9 @@ Comportamiento actual de los submenus:
   - compacta la columna elegida;
   - ejecuta las cuatro variantes de Fase 03.
 - `runPhase4Shell(...)`
-  - sigue siendo el submenu actual de la fase futura.
+  - pide origen/destino y umbral minimo;
+  - construye bins densos por `SEQ_ID`;
+  - ejecuta el histograma real de Fase 04.
 
 ### Flujo de llamadas real
 
@@ -409,7 +423,7 @@ flowchart TD
 - Cuando la carga termina bien, el resultado queda guardado en
   `appState.loadResult`, de forma que el menu y las fases futuras reutilizan el
   dataset sin volver a leer el CSV.
-- Las Fases 01, 02 y 03 preparan sus buffers desde
+- Las Fases 01, 02, 03 y 04 preparan sus buffers desde
   `appState.loadResult.dataset` y lanzan sus kernels sin recargar el fichero.
 
 ---
@@ -425,6 +439,9 @@ __global__ void reductionBasic(...);
 __global__ void reductionIntermediate(...);
 __global__ void reductionPattern(...);
 __global__ void reductionSimple(int* data, int* result, int n, bool isMax);
+__global__ void phase4SharedHistogramKernel(...);
+__global__ void phase4MergeHistogramKernel(...);
+__global__ void phase4GlobalHistogramKernel(...);
 ```
 
 ### Que hace cada kernel
@@ -451,6 +468,12 @@ __global__ void reductionSimple(int* data, int* result, int n, bool isMax);
 - `reductionPattern`
   - implementa la variante 3.4 de patron de reduccion por bloques y genera
     vectores parciales para reducciones sucesivas.
+- `phase4SharedHistogramKernel`
+  - construye un histograma parcial por bloque en memoria compartida.
+- `phase4MergeHistogramKernel`
+  - fusiona los parciales del histograma compartido.
+- `phase4GlobalHistogramKernel`
+  - sirve de respaldo si el numero de bins no cabe en memoria compartida.
 
 ---
 
@@ -469,8 +492,10 @@ __global__ void reductionSimple(int* data, int* result, int n, bool isMax);
 - consulta del hardware CUDA;
 - truncado de columnas a enteros para Fase 01 y Fase 02;
 - compactado de columnas validas para Fase 03;
+- construccion de bins densos `SEQ_ID -> indice` para Fase 04;
 - linealizacion de `TAIL_NUM` para Fase 02;
-- copia de resultados de Fase 02 desde device a host.
+- copia de resultados de Fase 02 y Fase 04 desde device a host;
+- dibujo textual del histograma de Fase 04.
 
 ### Hoy en GPU
 
@@ -485,11 +510,16 @@ __global__ void reductionSimple(int* data, int* result, int n, bool isMax);
   - variante 3.2 basica con memoria compartida y ventana de tres posiciones;
   - variante 3.3 intermedia con memoria compartida y publicacion por parejas;
   - variante 3.4 con patron de reduccion por bloques y cierre final en CPU.
-
-### Futuro previsto segun la estructura actual
-
 - Fase 04
-  - histograma por aeropuerto, previsiblemente basado en `SEQ_ID`.
+  - histograma por aeropuerto basado en `SEQ_ID` densos;
+  - uso de memoria compartida por bloque cuando el numero de bins cabe;
+  - respaldo global directo con atomicas si no cabe.
+
+### Punto importante del estado actual
+
+- la Fase 04 no trabaja con strings en GPU;
+- los `SEQ_ID` se convierten en bins densos simples;
+- el codigo del aeropuerto solo se recupera en CPU al imprimir.
 
 ---
 
@@ -501,8 +531,8 @@ Si hay que explicar el codigo hoy, la idea clave es esta:
 - ya tiene una **CLI completa** para el flujo de la practica;
 - ya tiene un **estado global coherente** en `AppState`;
 - ya conoce el **hardware CUDA disponible**;
-- ya ejecuta de forma real las **Fases 01, 02 y 03**;
-- y deja pendiente solo la **Fase 04**.
+- ya ejecuta de forma real las **Fases 01, 02, 03 y 04**;
+- y mantiene una separacion clara entre host y device.
 
 La defensa actual debe centrarse en:
 
@@ -513,6 +543,9 @@ La defensa actual debe centrarse en:
 - por que se consulta el hardware antes de fijar una configuracion de lanzamiento;
 - por que Fase 02 usa memoria constante y atomicas;
 - por que Fase 03 compacta los datos validos antes de reducir;
+- por que Fase 04 usa `SEQ_ID` y no strings en GPU;
+- por que el resumen inicial muestra `409` por `SEQ_ID` aunque solo haya `375`
+  codigos textuales;
 - y por que la variante 3.4 termina en CPU solo cuando quedan 10 valores o
   menos.
 
@@ -522,23 +555,23 @@ La defensa actual debe centrarse en:
 
 En el estado actual del proyecto:
 
-- la Fase 04 aun no ejecuta su computo CUDA real;
 - el build depende de que cada maquina tenga `CUDA_PATH` bien definido o, en su
   defecto, un `cuda.local.props` correcto;
 - el parser CSV es sencillo y deliberadamente limitado al dataset de la practica;
 - la aplicacion depende de que la cabecera del CSV coincida con el formato
   esperado;
 - la salida con `printf` desde GPU puede aparecer intercalada entre hilos;
+- la salida del histograma de Fase 04 respeta el orden de descubrimiento del
+  dataset y no ordena por ocurrencias;
 - no hay tests automaticos integrados en este entorno.
 
 ---
 
 ## Siguiente paso natural
 
-El siguiente paso tecnico coherente es implementar la **Fase 04** sobre esta
-base ya preparada:
+El siguiente paso tecnico coherente ya no es una fase nueva, sino pulir el
+proyecto completo:
 
-- reutilizando el mismo esquema de menu y lanzamiento por hardware;
-- manteniendo el acceso linealizado 1D;
-- y usando `ORIGIN_SEQ_ID` o `DEST_SEQ_ID` como apoyo para evitar trabajar con
-  strings directos en GPU.
+- validar tiempos de carga y de ejecucion en `Release`;
+- comprobar salidas con el profesorado en la maquina real;
+- y preparar la memoria, el video y la defensa con el flujo ya cerrado.
