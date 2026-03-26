@@ -6,92 +6,35 @@
 /*
     kernels.cu
 
-    Este archivo contiene la implementacion device/host asociada a los kernels
-    CUDA del proyecto. La idea es mantener aqui la logica que realmente se
-    ejecuta en GPU para no mezclarla con la parte de menu, carga de CSV o
-    preparacion de buffers que vive en main.cu.
+    Este archivo contiene la logica que se ejecuta en GPU. La parte de menu,
+    carga del CSV y preparacion del estado vive en main.cu.
 */
 
-// Configuracion minima de la Fase 02 almacenada en memoria constante. El
-// enunciado exige usar este tipo de memoria al menos para guardar el criterio
-// de filtrado, y aqui guardamos tanto el umbral como el modo.
-__constant__ int d_phase2Mode;
+// La Fase 02 mantiene en memoria constante solo el umbral firmado, que es la
+// configuracion comun a todos los hilos.
 __constant__ int d_phase2Threshold;
 
 /*
-    matchesDelayFilterMode
+    matchesSignedThreshold
 
-    Evalua el criterio comun de las Fases 01 y 02 usando:
+    Regla comun para Fase 01 y Fase 02:
 
-    - mode = 1 -> retraso: valor >= threshold
-    - mode = 2 -> adelanto: valor <= -threshold
-    - mode = 3 -> ambos: cualquiera de las dos condiciones
+    - threshold >= 0 -> buscar retrasos: value >= threshold
+    - threshold < 0 -> buscar adelantos: value <= threshold
 */
-__device__ bool matchesDelayFilterMode(int value, int mode, int threshold)
+__device__ bool matchesSignedThreshold(int value, int threshold)
 {
-    if (mode == 1) {
+    if (threshold >= 0) {
         return value >= threshold;
     }
 
-    if (mode == 2) {
-        return value <= -threshold;
-    }
-
-    return value >= threshold || value <= -threshold;
-}
-
-/*
-    detectDeviceDelayLabel
-
-    Devuelve la etiqueta a imprimir para un valor ya detectado. En modo
-    "ambos", la etiqueta depende del propio valor concreto.
-*/
-__device__ const char* detectDeviceDelayLabel(int value, int mode, int threshold)
-{
-    if (mode == 1) {
-        return "Retraso";
-    }
-
-    if (mode == 2) {
-        return "Adelanto";
-    }
-
-    if (value >= threshold) {
-        return "Retraso";
-    }
-
-    return "Adelanto";
-}
-
-/*
-    detectDeviceArrivalLabel
-
-    Variante textual especifica de la Fase 02 para que la salida desde GPU use
-    exactamente la etiqueta de llegada y no una deduccion indirecta.
-*/
-__device__ const char* detectDeviceArrivalLabel(int value, int mode, int threshold)
-{
-    if (mode == 1) {
-        return "Retraso (llegada)";
-    }
-
-    if (mode == 2) {
-        return "Adelanto (llegada)";
-    }
-
-    if (value >= threshold) {
-        return "Retraso (llegada)";
-    }
-
-    return "Adelanto (llegada)";
+    return value <= threshold;
 }
 
 /*
     deviceCompareReduction
 
-    Comparador minimo comun para las cuatro variantes de la Fase 03. Se deja
-    en device para poder reutilizar la misma logica dentro de varios kernels
-    sin depender de funciones auxiliares de otras librerias.
+    Comparador minimo comun para las cuatro variantes de la Fase 03.
 */
 __device__ int deviceCompareReduction(int left, int right, bool isMax)
 {
@@ -105,21 +48,12 @@ __device__ int deviceCompareReduction(int left, int right, bool isMax)
 /*
     computeWindowReductionFromGlobal
 
-    Helper interno usado por la variante intermedia cuando el segundo elemento
-    de la pareja cae en otro bloque. Calcula, leyendo memoria global, el mejor
-    valor entre:
-
-    - la posicion anterior;
-    - la posicion actual;
-    - la posicion posterior.
-
-    Si alguna posicion no existe, se sustituye por la identidad de la
-    reduccion para no contaminar el resultado.
+    Helper interno usado por la variante intermedia cuando la pareja cruza el
+    limite de bloque.
 */
 __device__ int computeWindowReductionFromGlobal(const int* data, int n, int idx, bool isMax)
 {
     const int identity = isMax ? INT_MIN : INT_MAX;
-
     int bestValue = data[idx];
 
     if (idx > 0) {
@@ -137,70 +71,33 @@ __device__ int computeWindowReductionFromGlobal(const int* data, int n, int idx,
     return bestValue;
 }
 
-/*
-    copyPhase2FilterConfigToConstant
-
-    Copia desde host a memoria constante la configuracion que necesita la Fase
-    02: modo y umbral absoluto.
-*/
-cudaError_t copyPhase2FilterConfigToConstant(int mode, int threshold)
+cudaError_t copyPhase2ThresholdToConstant(int threshold)
 {
-    cudaError_t status = cudaMemcpyToSymbol(d_phase2Mode, &mode, sizeof(int));
-
-    if (status != cudaSuccess) {
-        return status;
-    }
-
     return cudaMemcpyToSymbol(d_phase2Threshold, &threshold, sizeof(int));
 }
 
-/*
-    phase1DepartureDelayKernel
-
-    Cada hilo procesa una fila del vector DEP_DELAY cacheado en GPU. Si el
-    valor original es NAN, el propio kernel ignora esa posicion. El truncado a
-    entero se hace aqui mismo porque la practica solo necesita el entero al
-    comparar e imprimir.
-*/
-__global__ void phase1DepartureDelayKernel(
-    const float* delayValues,
-    int totalElements,
-    int mode,
-    int threshold)
+__global__ void phase1DepartureDelayKernel(const float* delayValues, int totalElements, int threshold)
 {
-    // Formula clasica de acceso linealizado 1D en CUDA.
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
-    // Si sobran hilos respecto al tamano real del vector, salen sin tocar
-    // memoria para evitar accesos fuera de rango.
     if (idx >= totalElements) {
         return;
     }
 
     const float rawValue = delayValues[idx];
 
-    // Un NAN representa un dato ausente en el CSV y se ignora directamente.
     if (rawValue != rawValue) {
         return;
     }
 
     const int delayValue = static_cast<int>(rawValue);
 
-    const bool matchesThreshold = matchesDelayFilterMode(delayValue, mode, threshold);
-
-    if (matchesThreshold) {
-        const char* detectedLabel = detectDeviceDelayLabel(delayValue, mode, threshold);
-        printf("- Hilo #%d: %s de %d minutos\n", idx, detectedLabel, delayValue);
+    if (matchesSignedThreshold(delayValue, threshold)) {
+        const char* label = threshold >= 0 ? "Retraso" : "Adelanto";
+        printf("- Hilo #%d: %s de %d minutos\n", idx, label, delayValue);
     }
 }
 
-/*
-    phase2ArrivalDelayKernel
-
-    Cada hilo analiza una fila de ARR_DELAY y, si cumple el umbral constante,
-    reserva una posicion libre en la salida con una operacion atomica. El dato
-    numerico entra como float y se trunca en el propio kernel.
-*/
 __global__ void phase2ArrivalDelayKernel(
     const float* delayValues,
     const char* tailNumIn,
@@ -209,7 +106,6 @@ __global__ void phase2ArrivalDelayKernel(
     int* outDelayValues,
     char* outTailNumBuffer)
 {
-    // Cada hilo trabaja sobre una unica fila del dataset.
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
     if (idx >= totalElements) {
@@ -224,66 +120,40 @@ __global__ void phase2ArrivalDelayKernel(
 
     const int delayValue = static_cast<int>(rawValue);
 
-    // El modo y el umbral viven en memoria constante para cumplir el requisito
-    // del enunciado y porque son valores comunes a todos los hilos.
-    const bool matchesThreshold =
-        matchesDelayFilterMode(delayValue, d_phase2Mode, d_phase2Threshold);
-
-    if (!matchesThreshold) {
+    if (!matchesSignedThreshold(delayValue, d_phase2Threshold)) {
         return;
     }
 
-    // atomicAdd devuelve el hueco reservado para este hilo dentro de la salida.
     const int outputIndex = atomicAdd(outCount, 1);
 
     outDelayValues[outputIndex] = delayValue;
 
-    // Calculamos el inicio de la matricula de entrada y el de la salida
-    // usando un stride fijo para mantener un layout muy simple.
     const char* inputTailNum = tailNumIn + idx * kPhase2TailNumStride;
     char* outputTailNum = outTailNumBuffer + outputIndex * kPhase2TailNumStride;
 
-    // Copiamos toda la celda fija. El host ya garantiza que la cadena esta
-    // terminada en '\0', asi que la salida seguira siendo imprimible.
     for (int i = 0; i < kPhase2TailNumStride; ++i) {
         outputTailNum[i] = inputTailNum[i];
     }
 
-    // La salida puede intercalarse entre hilos. Eso es normal con printf
-    // desde GPU y no afecta al resultado almacenado en memoria.
-    const char* detectedLabel =
-        detectDeviceArrivalLabel(delayValue, d_phase2Mode, d_phase2Threshold);
+    const char* label = d_phase2Threshold >= 0 ? "Retraso (llegada)" : "Adelanto (llegada)";
 
     printf("- Hilo #%d  Matricula: %s  %s: %d min\n",
         idx,
         outputTailNum,
-        detectedLabel,
+        label,
         delayValue);
 }
 
-/*
-    reductionSimple
-
-    Kernel de reduccion simple que ya existia en el repositorio. Se conserva
-    como base de la variante 3.1 de la Fase 03.
-*/
 __global__ void reductionSimple(int* data, int* result, int n, bool isMax)
 {
-    // Formula clasica de acceso linealizado 1D en CUDA.
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
-    // Si sobran hilos respecto al tamano real del vector, esos hilos salen
-    // inmediatamente para no leer fuera de rango.
     if (idx >= n) {
         return;
     }
 
-    // Cada hilo solo lee el elemento que le corresponde dentro del vector.
     const int value = data[idx];
 
-    // La rama selecciona el tipo de reduccion pedido por el host. Ambas usan
-    // operaciones atomicas porque varios hilos pueden intentar actualizar el
-    // mismo acumulador global al mismo tiempo.
     if (isMax) {
         atomicMax(result, value);
     } else {
@@ -291,18 +161,6 @@ __global__ void reductionSimple(int* data, int* result, int n, bool isMax)
     }
 }
 
-/*
-    reductionBasic
-
-    Variante 3.2. Cada hilo trabaja con una ventana de tres posiciones:
-
-    - anterior;
-    - actual;
-    - siguiente.
-
-    La informacion vecina se apoya en memoria compartida para que el acceso
-    quede claramente visible y separado de la memoria global.
-*/
 __global__ void reductionBasic(const int* data, int* result, int n, bool isMax)
 {
     extern __shared__ int sharedWindow[];
@@ -322,14 +180,12 @@ __global__ void reductionBasic(const int* data, int* result, int n, bool isMax)
         validElementsInBlock = blockDim.x;
     }
 
-    // Cada hilo deja su valor en la zona central de la ventana compartida.
     if (globalIndex < n) {
         sharedWindow[localIndex + 1] = data[globalIndex];
     } else {
         sharedWindow[localIndex + 1] = identity;
     }
 
-    // Un unico hilo carga los halos de izquierda y derecha del bloque.
     if (localIndex == 0) {
         sharedWindow[0] = blockStart > 0 ? data[blockStart - 1] : identity;
 
@@ -347,12 +203,8 @@ __global__ void reductionBasic(const int* data, int* result, int n, bool isMax)
         return;
     }
 
-    const int previousValue = sharedWindow[localIndex];
-    const int currentValue = sharedWindow[localIndex + 1];
-    const int nextValue = sharedWindow[localIndex + 2];
-
-    int bestValue = deviceCompareReduction(previousValue, currentValue, isMax);
-    bestValue = deviceCompareReduction(bestValue, nextValue, isMax);
+    int bestValue = deviceCompareReduction(sharedWindow[localIndex], sharedWindow[localIndex + 1], isMax);
+    bestValue = deviceCompareReduction(bestValue, sharedWindow[localIndex + 2], isMax);
 
     if (isMax) {
         atomicMax(result, bestValue);
@@ -361,20 +213,10 @@ __global__ void reductionBasic(const int* data, int* result, int n, bool isMax)
     }
 }
 
-/*
-    reductionIntermediate
-
-    Variante 3.3. La primera parte es igual que la basica: cada hilo consulta
-    una ventana de tres posiciones usando memoria compartida. La diferencia es
-    que el mejor valor local se guarda en una segunda zona compartida y solo
-    los hilos con indice global par publican por parejas hacia memoria global.
-*/
 __global__ void reductionIntermediate(const int* data, int* result, int n, bool isMax)
 {
     extern __shared__ int sharedMemory[];
 
-    // Repartimos la memoria compartida en dos zonas contiguas:
-    // una para la ventana con halo y otra para el mejor valor local.
     int* sharedWindow = sharedMemory;
     int* sharedLocalBest = sharedMemory + blockDim.x + 2;
 
@@ -422,11 +264,7 @@ __global__ void reductionIntermediate(const int* data, int* result, int n, bool 
 
     __syncthreads();
 
-    if (globalIndex >= n) {
-        return;
-    }
-
-    if ((globalIndex % 2) != 0) {
+    if (globalIndex >= n || (globalIndex % 2) != 0) {
         return;
     }
 
@@ -434,14 +272,10 @@ __global__ void reductionIntermediate(const int* data, int* result, int n, bool 
     const int nextGlobalIndex = globalIndex + 1;
 
     if (nextGlobalIndex < n) {
-        // Si el siguiente hilo esta dentro del mismo bloque, reutilizamos la
-        // memoria compartida. Si no, recalculamos su ventana desde memoria
-        // global para no perder la pareja que cruza el limite del bloque.
         if (localIndex + 1 < validElementsInBlock) {
             pairBest = deviceCompareReduction(pairBest, sharedLocalBest[localIndex + 1], isMax);
         } else {
-            const int nextBest = computeWindowReductionFromGlobal(data, n, nextGlobalIndex, isMax);
-            pairBest = deviceCompareReduction(pairBest, nextBest, isMax);
+            pairBest = deviceCompareReduction(pairBest, computeWindowReductionFromGlobal(data, n, nextGlobalIndex, isMax), isMax);
         }
     }
 
@@ -452,13 +286,6 @@ __global__ void reductionIntermediate(const int* data, int* result, int n, bool 
     }
 }
 
-/*
-    reductionPattern
-
-    Variante 3.4. Cada bloque reduce su tramo del vector a un unico parcial.
-    El host relanzara el mismo patron sobre el vector de parciales hasta dejar
-    10 elementos o menos, momento en el que cerrara el resultado en CPU.
-*/
 __global__ void reductionPattern(const int* input, int* output, int n, bool isMax)
 {
     extern __shared__ int sharedReduction[];
@@ -475,7 +302,6 @@ __global__ void reductionPattern(const int* input, int* output, int n, bool isMa
 
     __syncthreads();
 
-    // Reducimos por parejas sucesivas hasta dejar un unico valor por bloque.
     for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
         if (localIndex < stride) {
             sharedReduction[localIndex] =
@@ -490,13 +316,6 @@ __global__ void reductionPattern(const int* input, int* output, int n, bool isMa
     }
 }
 
-/*
-    phase4SharedHistogramKernel
-
-    Cada bloque mantiene una copia privada del histograma en memoria
-    compartida. Esto reduce la contencion respecto a hacer todas las atomicas
-    directamente sobre memoria global.
-*/
 __global__ void phase4SharedHistogramKernel(
     const int* denseIndices,
     int totalElements,
@@ -508,8 +327,6 @@ __global__ void phase4SharedHistogramKernel(
     const int globalIndex = blockIdx.x * blockDim.x + threadIdx.x;
     const int localIndex = threadIdx.x;
 
-    // Como puede haber mas bins que hilos por bloque, inicializamos la zona
-    // compartida por tramos.
     for (int bin = localIndex; bin < totalBins; bin += blockDim.x) {
         sharedHistogram[bin] = 0;
     }
@@ -517,14 +334,11 @@ __global__ void phase4SharedHistogramKernel(
     __syncthreads();
 
     if (globalIndex < totalElements) {
-        const int denseIndex = denseIndices[globalIndex];
-        atomicAdd(&sharedHistogram[denseIndex], 1U);
+        atomicAdd(&sharedHistogram[denseIndices[globalIndex]], 1U);
     }
 
     __syncthreads();
 
-    // Volcamos el histograma privado del bloque a la matriz global de
-    // parciales. Cada bloque escribe una fila completa de totalBins columnas.
     unsigned int* blockPartialHistogram = partialHistograms + blockIdx.x * totalBins;
 
     for (int bin = localIndex; bin < totalBins; bin += blockDim.x) {
@@ -532,12 +346,6 @@ __global__ void phase4SharedHistogramKernel(
     }
 }
 
-/*
-    phase4MergeHistogramKernel
-
-    Cada hilo fusiona un bin del histograma final sumando el mismo bin de todos
-    los bloques parciales generados en la primera pasada.
-*/
 __global__ void phase4MergeHistogramKernel(
     const unsigned int* partialHistograms,
     int partialCount,
