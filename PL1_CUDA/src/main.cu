@@ -219,7 +219,7 @@ int main()
             int threshold = 0;
 
             if (!readSignedThreshold(
-                    "Umbral firmado (positivo=retraso, negativo=adelanto, X para volver): ",
+                    "Umbral (positivo=retraso, negativo=adelanto, X para volver): ",
                     threshold)) {
                 continue;
             }
@@ -240,7 +240,7 @@ int main()
             int threshold = 0;
 
             if (!readSignedThreshold(
-                    "Umbral firmado (positivo=retraso, negativo=adelanto, X para volver): ",
+                    "Umbral (positivo=retraso, negativo=adelanto, X para volver): ",
                     threshold)) {
                 continue;
             }

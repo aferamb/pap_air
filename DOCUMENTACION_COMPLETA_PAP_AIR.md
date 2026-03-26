@@ -590,11 +590,10 @@ solo con el signo del umbral.
 
 ## 5.4. `executeAndWait`
 
-La version actual del proyecto ya no usa un helper generico tipo `cudaOk(...)`
-para envolver todas las reservas y copias. Las operaciones `cudaMalloc`,
-`cudaMemcpy`, `cudaMemset` y `cudaMemcpyToSymbol` se invocan de forma directa.
-
-El unico helper CUDA comun que se mantiene es `executeAndWait(...)`.
+El proyecto usa llamadas directas a `cudaMalloc`, `cudaMemcpy`, `cudaMemset` y
+`cudaMemcpyToSymbol` cuando reserva, copia o inicializa memoria device. El
+unico helper CUDA comun compartido entre modulos es `executeAndWait(...)`, que
+se aplica justo despues de cada kernel.
 
 ### `executeAndWait`
 
@@ -1552,8 +1551,8 @@ flowchart TD
 
 ## 13. Reparto actual por modulos
 
-La version actual ya no concentra toda la parte CUDA en un unico `kernels.cu`.
-El calculo y la organizacion se reparten por responsabilidad.
+El calculo CUDA y la orquestacion host se reparten por responsabilidad entre
+modulos pequenos y especializados.
 
 ### 13.1. `comun.cuh` y `comun.cu`
 
@@ -1586,7 +1585,7 @@ Y, como helpers internos, contienen:
 
 ### 13.3. `parte1.cuh/.cu` a `parte4.cuh/.cu`
 
-Cada fase publica una API minima:
+Cada fase publica una funcion host `void` minima:
 
 - `phase01(int threshold)`
 - `phase02(int threshold)`
@@ -1594,7 +1593,9 @@ Cada fase publica una API minima:
 - `phase04(int airportOption, int threshold)`
 
 Y mantiene dentro de su `.cu` los kernels y helpers internos necesarios para esa
-fase.
+fase. En el caso de Fase 03, los helpers internos `phase03AtomicVariant(...)`
+y `phase03ReductionVariant(...)` siguen devolviendo `bool` porque necesitan
+cortar la cadena de reducciones si falla una variante intermedia.
 
 ### 13.4. Por que este reparto es importante
 
@@ -1614,12 +1615,11 @@ Este reparto refleja mejor el codigo actual:
 | Tipo de memoria | Donde aparece | Para que se usa |
 |---|---|---|
 | Global | `d_depDelay`, `d_arrDelay`, `d_tailNums`, entradas y salidas | Dataset principal y resultados |
-| Constante | `d_phase2Threshold` | Configuracion comun de Fase 02 |
+| Constante | `d_phase2Threshold` | Umbral firmado de Fase 02 |
 | Compartida | `sharedWindow`, `sharedLocalBest`, `sharedReduction`, `sharedHistogram` | Reducciones e histograma |
 | Host | vectores y mapas C++ | Carga, compactado, impresion |
 
-Aunque el calculo ya no este concentrado en un fichero `kernels.cu`, el uso de
-memoria CUDA sigue siendo el mismo. La diferencia es organizativa:
+El uso de memoria CUDA se reparte por fase y por responsabilidad:
 
 - `parte1.cu` aloja el kernel de Fase 01;
 - `parte2.cu` aloja el kernel y la memoria constante de Fase 02;

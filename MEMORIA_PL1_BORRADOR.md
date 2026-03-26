@@ -734,17 +734,17 @@ Aunque la memoria no pretende describir cada linea, si conviene dejar claro el p
 - `computeLaunchConfig(...)`: calcula bloques e hilos por bloque.
 - `executeAndWait(...)`: verifica lanzamiento y sincroniza.
 
-En la version actual ya no existe un helper general `cudaOk(...)` para envolver
-reservas y copias. El unico helper CUDA comun que se mantiene es
-`executeAndWait(...)`, usado despues de cada kernel para detectar errores de
-lanzamiento o de ejecucion.
+Las reservas, copias e inicializaciones CUDA se hacen con llamadas directas a
+`cudaMalloc`, `cudaMemcpy`, `cudaMemset` y `cudaMemcpyToSymbol`. El unico
+helper CUDA comun compartido entre fases es `executeAndWait(...)`, usado
+despues de cada kernel para detectar errores de lanzamiento o de ejecucion.
 
 ### 12.3. Fases
 
-- `phase01(...)`: filtro firmado sobre `DEP_DELAY`.
-- `phase02(...)`: filtro firmado sobre `ARR_DELAY` y resumen CPU.
-- `phase03(...)`: orquesta las cuatro reducciones.
-- `phase04(...)`: construye el histograma por aeropuerto.
+- `phase01(...)`: API host `void` para el filtro firmado sobre `DEP_DELAY`.
+- `phase02(...)`: API host `void` para el filtro firmado sobre `ARR_DELAY` y el resumen CPU.
+- `phase03(...)`: API host `void` que orquesta las cuatro reducciones.
+- `phase04(...)`: API host `void` que construye el histograma por aeropuerto.
 
 ### 12.4. Kernels
 
