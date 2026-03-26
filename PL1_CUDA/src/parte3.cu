@@ -8,41 +8,64 @@
 #include "comun.cuh"
 
 namespace {
+
+/*
+variantes de reducción atómica (Simple, Basica e Intermedia)
+*/
 enum class Phase3AtomicVariant {
     Simple,
     Basic,
     Intermediate
 };
 
+/** @brief Compara dos valores enteros y devuelve el máximo o mínimo según el parámetro isMax.
+ * @param left Primer valor a comparar.
+ * @param right Segundo valor a comparar.
+ * @param isMax Indica si se desea obtener el máximo (true) o el mínimo (false).
+ * @return El valor máximo o mínimo según el parámetro isMax.
+ */
 __device__ int deviceCompareReduction(int left, int right, bool isMax)
 {
     if (isMax) {
-        return left > right ? left : right;
+        return left > right ? left : right; // Maximo
     }
 
-    return left < right ? left : right;
+    return left < right ? left : right; // Minimo
 }
 
+/** @brief Calcula la reducción de una ventana desde la memoria global.
+ * @param data Puntero a los datos.
+ * @param n Número de elementos.
+ * @param idx Índice del elemento actual.
+ * @param isMax Indica si se desea obtener el máximo (true) o el mínimo (false).
+ * @return El valor máximo o mínimo de la ventana.
+ */
 __device__ int computeWindowReductionFromGlobal(const int* data, int n, int idx, bool isMax)
 {
     const int identity = isMax ? INT_MIN : INT_MAX;
     int bestValue = data[idx];
 
     if (idx > 0) {
-        bestValue = deviceCompareReduction(bestValue, data[idx - 1], isMax);
+        bestValue = deviceCompareReduction(bestValue, data[idx - 1], isMax); // Comparar con el elemento anterior
     } else {
-        bestValue = deviceCompareReduction(bestValue, identity, isMax);
+        bestValue = deviceCompareReduction(bestValue, identity, isMax); // Si no hay elemento anterior, comparar con el valor identidad
     }
 
     if (idx + 1 < n) {
-        bestValue = deviceCompareReduction(bestValue, data[idx + 1], isMax);
+        bestValue = deviceCompareReduction(bestValue, data[idx + 1], isMax); // Comparar con el elemento siguiente
     } else {
-        bestValue = deviceCompareReduction(bestValue, identity, isMax);
+        bestValue = deviceCompareReduction(bestValue, identity, isMax); // Si no hay elemento siguiente, comparar con el valor identidad
     }
 
     return bestValue;
 }
 
+/** @brief Realiza una reducción simple en la memoria global.
+ * @param data Puntero a los datos.
+ * @param result Puntero al resultado.
+ * @param n Número de elementos.
+ * @param isMax Indica si se desea obtener el máximo (true) o el mínimo (false).
+ */
 __global__ void reductionSimple(int* data, int* result, int n, bool isMax)
 {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -51,9 +74,9 @@ __global__ void reductionSimple(int* data, int* result, int n, bool isMax)
     }
     const int value = data[idx];
     if (isMax) {
-        atomicMax(result, value);
+        atomicMax(result, value); // Reducción atómica para máximo
     } else {
-        atomicMin(result, value);
+        atomicMin(result, value); // Reducción atómica para mínimo
     }
 }
 

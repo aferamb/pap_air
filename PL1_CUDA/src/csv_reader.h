@@ -6,20 +6,6 @@
 #include <vector>
 
 /*
-    csv_reader.h
-
-    Este modulo se ha simplificado para quedarse solo con lo que hoy usa la
-    practica:
-
-    - las columnas reales de las Fases 01, 02, 03 y 04;
-    - un resumen pequeno de la carga.
-
-    La cabecera ya no intenta describir un lector generico. El CSV de la
-    practica es fijo y conocido, asi que la carga se apoya en indices de
-    columna constantes y en una limpieza basica en una sola pasada.
-*/
-
-/*
     DatasetColumns
 
     Estructura principal del dataset en memoria del host. Se guardan solo las
