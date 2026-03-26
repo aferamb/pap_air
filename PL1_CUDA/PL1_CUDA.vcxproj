@@ -99,12 +99,22 @@
     </CudaCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <CudaCompile Include="src\kernels.cu" />
+    <CudaCompile Include="src\comun.cu" />
+    <CudaCompile Include="src\dataset_gpu.cu" />
     <CudaCompile Include="src\main.cu" />
+    <CudaCompile Include="src\parte1.cu" />
+    <CudaCompile Include="src\parte2.cu" />
+    <CudaCompile Include="src\parte3.cu" />
+    <CudaCompile Include="src\parte4.cu" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="src\comun.cuh" />
     <ClInclude Include="src\csv_reader.h" />
-    <ClInclude Include="src\kernels.cuh" />
+    <ClInclude Include="src\dataset_gpu.cuh" />
+    <ClInclude Include="src\parte1.cuh" />
+    <ClInclude Include="src\parte2.cuh" />
+    <ClInclude Include="src\parte3.cuh" />
+    <ClInclude Include="src\parte4.cuh" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\csv_reader.cpp" />
