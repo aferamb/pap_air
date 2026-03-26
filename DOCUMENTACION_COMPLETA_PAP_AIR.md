@@ -17,10 +17,16 @@ programa, sino explicar:
 El estado que se documenta aqui es el **codigo actual real** de:
 
 - `PL1_CUDA/src/main.cu`
-- `PL1_CUDA/src/kernels.cuh`
-- `PL1_CUDA/src/kernels.cu`
+- `PL1_CUDA/src/comun.cuh`
+- `PL1_CUDA/src/comun.cu`
 - `PL1_CUDA/src/csv_reader.h`
 - `PL1_CUDA/src/csv_reader.cpp`
+- `PL1_CUDA/src/dataset_gpu.cuh`
+- `PL1_CUDA/src/dataset_gpu.cu`
+- `PL1_CUDA/src/parte1.cuh` y `PL1_CUDA/src/parte1.cu`
+- `PL1_CUDA/src/parte2.cuh` y `PL1_CUDA/src/parte2.cu`
+- `PL1_CUDA/src/parte3.cuh` y `PL1_CUDA/src/parte3.cu`
+- `PL1_CUDA/src/parte4.cuh` y `PL1_CUDA/src/parte4.cu`
 
 No se documenta una arquitectura ideal ni una version antigua. Todo lo que
 aparece aqui intenta corresponder con el codigo que esta en el repositorio.
@@ -44,24 +50,31 @@ cosas principales:
 
 | Archivo | Lineas aprox. | Papel |
 |---|---:|---|
-| `PL1_CUDA/src/main.cu` | 1269 | Flujo host, CLI, estado global, subida a GPU y orquestacion |
-| `PL1_CUDA/src/kernels.cuh` | 87 | Declaraciones CUDA publicas |
-| `PL1_CUDA/src/kernels.cu` | 368 | Implementacion de kernels y helpers device |
-| `PL1_CUDA/src/csv_reader.h` | 86 | Tipos del dataset y API del lector |
-| `PL1_CUDA/src/csv_reader.cpp` | 275 | Carga y limpieza del CSV |
+| `PL1_CUDA/src/main.cu` | 329 | CLI y bucle principal |
+| `PL1_CUDA/src/comun.cuh/.cu` | 200 | Globals compartidas, GPU y utilidades comunes |
+| `PL1_CUDA/src/csv_reader.h/.cpp` | 361 | Carga y limpieza del CSV |
+| `PL1_CUDA/src/dataset_gpu.cuh/.cu` | 298 | Fase 0 real y dataset persistente en GPU |
+| `PL1_CUDA/src/parte1.cuh/.cu` | 76 | Fase 01 |
+| `PL1_CUDA/src/parte2.cuh/.cu` | 155 | Fase 02 |
+| `PL1_CUDA/src/parte3.cuh/.cu` | 347 | Fase 03 |
+| `PL1_CUDA/src/parte4.cuh/.cu` | 212 | Fase 04 |
 
 ### 1.3. Arquitectura por modulos
 
 ```mermaid
 flowchart LR
-    A[main.cu] --> B[csv_reader.h / csv_reader.cpp]
-    A --> C[kernels.cuh / kernels.cu]
-    B --> D[DatasetColumns]
-    B --> E[LoadSummary]
-    C --> F[Kernels CUDA]
-    A --> G[CLI]
-    A --> H[Globals host]
-    A --> I[Globals device]
+    A[main.cu] --> B[comun.cuh / comun.cu]
+    A --> C[dataset_gpu.cuh / dataset_gpu.cu]
+    A --> D[parte1.cuh / parte1.cu]
+    A --> E[parte2.cuh / parte2.cu]
+    A --> F[parte3.cuh / parte3.cu]
+    A --> G[parte4.cuh / parte4.cu]
+    C --> H[csv_reader.h / csv_reader.cpp]
+    C --> B
+    D --> B
+    E --> B
+    F --> B
+    G --> B
 ```
 
 ### 1.4. Filosofia de implementacion
@@ -69,11 +82,11 @@ flowchart LR
 La version actual intenta ser mas simple que una arquitectura muy encapsulada.
 Por eso:
 
-- `main.cu` usa **globals host/device**;
-- el dataset que hace falta para varias fases se sube una sola vez a GPU;
-- `csv_reader` se dedica solo a leer el CSV;
-- `kernels.cu` concentra la logica device;
-- se evita pasar structs grandes de una funcion a otra.
+- `main.cu` se limita a la consola y al flujo principal;
+- `comun.cu` centraliza globals y utilidades CUDA comunes;
+- `dataset_gpu.cu` concentra la Fase 0 y el dataset persistente en GPU;
+- cada fase tiene su propio modulo `parteN.cu`;
+- se evita pasar structs grandes entre modulos gracias al estado global compartido.
 
 La consecuencia de esta decision es importante:
 
@@ -226,10 +239,11 @@ struct LoadSummary {
 
 No guarda datos de computo, solo trazabilidad de la carga.
 
-## 3.3. Globals host y device de `main.cu`
+## 3.3. Globals host y device del proyecto
 
-`main.cu` tiene un bloque de globals simples. Son la base de toda la
-arquitectura actual.
+Las globals del proyecto se declaran en `comun.cuh` y se definen realmente en
+`comun.cu`. Son la base de toda la arquitectura actual y permiten que los
+modulos de fase compartan estado sin firmas largas.
 
 ### Host
 
@@ -510,7 +524,7 @@ flowchart LR
 
 ---
 
-## 5. `main.cu`: host, globals y orquestacion
+## 5. Soporte host y orquestacion
 
 ## 5.1. `LaunchConfig`
 
@@ -521,11 +535,13 @@ struct LaunchConfig {
 };
 ```
 
-Solo guarda la configuracion minima de un lanzamiento 1D.
+`LaunchConfig` se declara en `comun.cuh` y solo guarda la configuracion minima
+de un lanzamiento 1D.
 
 ## 5.2. `Phase3AtomicVariant`
 
-Este `enum class` no representa fases del menu, sino solo las tres variantes
+Este `enum class`, definido dentro de `parte3.cu`, no representa fases del
+menu, sino solo las tres variantes
 atomicas de la Fase 03:
 
 - `Simple`
@@ -572,15 +588,13 @@ Lee un entero firmado para Fases 01 y 02. La semantica es:
 No existe ya un modo separado "retraso/adelanto/ambos". La decision se toma
 solo con el signo del umbral.
 
-## 5.4. `cudaOk` y `executeAndWait`
+## 5.4. `executeAndWait`
 
-Estas dos funciones concentran la gestion de error CUDA del host.
+La version actual del proyecto ya no usa un helper generico tipo `cudaOk(...)`
+para envolver todas las reservas y copias. Las operaciones `cudaMalloc`,
+`cudaMemcpy`, `cudaMemset` y `cudaMemcpyToSymbol` se invocan de forma directa.
 
-### `cudaOk`
-
-- recibe un `cudaError_t`
-- si es `cudaSuccess`, devuelve `true`
-- si no, imprime el contexto y devuelve `false`
+El unico helper CUDA comun que se mantiene es `executeAndWait(...)`.
 
 ### `executeAndWait`
 
@@ -745,6 +759,17 @@ denseToSeqId = [12001, 12478, 13055]
 denseInput   = [0, 1, 0, 2]
 ```
 
+Si el recorrido no encuentra ningun `SEQ_ID` valido con codigo asociado, el
+resultado puede quedar vacio:
+
+```text
+denseToSeqId = []
+denseInput   = []
+```
+
+Ese caso no se trata como error. Simplemente significa que para ese lado del
+histograma no hay categorias validas que construir.
+
 ### Diagrama
 
 ```mermaid
@@ -811,6 +836,31 @@ flowchart TD
 - no sube `weatherDelay`
 - no sube mapas `ID -> codigo`
 - no sube `LoadSummary`
+
+### Por que se mantienen los `if (!...empty())`
+
+En esta funcion aparecen guards como:
+
+- `if (!originDenseInput.empty())`
+- `if (!destinationDenseInput.empty())`
+
+Estos `if` no son comprobaciones de error CUDA del estilo que se simplificaron
+en otras partes del proyecto. Su papel es distinto: protegen el caso en el que
+el vector denso tiene tamano 0.
+
+La idea es deliberadamente simple:
+
+- si hay elementos validos, se reserva y se copia el buffer;
+- si no los hay, no se reserva nada y el puntero device queda en `nullptr`.
+
+Esto evita hacer `cudaMalloc` y `cudaMemcpy` sobre una entrada vacia y, ademas,
+deja una semantica muy clara para Fase 04:
+
+- puntero valido -> existe un histograma que se puede construir;
+- puntero nulo -> no hay datos validos para ese lado.
+
+Por tanto, estos guards si se conservan a proposito. No son “boilerplate de
+errores”, sino parte de la logica de datos.
 
 ---
 
@@ -1028,7 +1078,7 @@ flowchart TD
 
 ## 10.3. Memoria constante
 
-`kernels.cu` declara:
+`parte2.cu` declara:
 
 ```cpp
 __constant__ int d_phase2Threshold;
@@ -1391,7 +1441,7 @@ Pasos:
    - `denseInput`
    - `denseToSeqId`
    - `idToCode`
-3. verifica `totalElements` y `totalBins`
+3. verifica `totalElements`, `totalBins` y `denseInput`
 4. verifica que el histograma cabe en shared memory
 5. reserva:
    - `devicePartialHistograms`
@@ -1400,6 +1450,17 @@ Pasos:
 7. lanza `phase4MergeHistogramKernel`
 8. copia histograma a CPU
 9. llama a `printPhase4Histogram`
+
+La condicion:
+
+```cpp
+if (totalElements <= 0 || totalBins <= 0 || denseInput == nullptr)
+```
+
+no esta pensada como control de error CUDA, sino como cierre logico del flujo
+de preparacion. Si `subirDatasetAGPU(...)` no construyo entrada densa para
+origen o destino, `phase04(...)` interpreta correctamente que no hay histograma
+que lanzar.
 
 ## 12.4. `phase4SharedHistogramKernel`
 
@@ -1489,33 +1550,64 @@ flowchart TD
 
 ---
 
-## 13. `kernels.cuh`: interfaz publica device
+## 13. Reparto actual por modulos
 
-`kernels.cuh` expone lo que `main.cu` necesita conocer de la parte CUDA.
+La version actual ya no concentra toda la parte CUDA en un unico `kernels.cu`.
+El calculo y la organizacion se reparten por responsabilidad.
 
-### Elementos declarados
+### 13.1. `comun.cuh` y `comun.cu`
 
-- constante de tamano:
-  - `kPhase2TailNumStride`
-- helper host:
-  - `copyPhase2ThresholdToConstant`
-- helpers device:
-  - `deviceCompareReduction`
-- kernels:
-  - `phase1DepartureDelayKernel`
-  - `phase2ArrivalDelayKernel`
-  - `reductionSimple`
-  - `reductionBasic`
-  - `reductionIntermediate`
-  - `reductionPattern`
-  - `phase4SharedHistogramKernel`
-  - `phase4MergeHistogramKernel`
+Estos dos ficheros contienen:
 
-La cabecera no contiene implementacion, solo contratos.
+- `LaunchConfig`
+- globals host `g_*`
+- punteros device `d_*`
+- `executeAndWait(...)`
+- `queryGpuInfo()`
+- `computeLaunchConfig(...)`
+- `printGpuSummary()`
+
+Es el punto comun del que dependen el resto de modulos.
+
+### 13.2. `dataset_gpu.cuh` y `dataset_gpu.cu`
+
+Estos modulos implementan la Fase 0 real del programa:
+
+- `liberarGPU()`
+- `printLoadSummary()`
+- `cargarDataset(...)`
+- `datasetListoParaGPU()`
+
+Y, como helpers internos, contienen:
+
+- `buildTailBuffer(...)`
+- `buildDenseInput(...)`
+- `subirDatasetAGPU(...)`
+
+### 13.3. `parte1.cuh/.cu` a `parte4.cuh/.cu`
+
+Cada fase publica una API minima:
+
+- `phase01(int threshold)`
+- `phase02(int threshold)`
+- `phase03(int columnOption, int reductionOption)`
+- `phase04(int airportOption, int threshold)`
+
+Y mantiene dentro de su `.cu` los kernels y helpers internos necesarios para esa
+fase.
+
+### 13.4. Por que este reparto es importante
+
+Este reparto refleja mejor el codigo actual:
+
+- `main.cu` ya no contiene la logica CUDA real;
+- los helpers de cada fase viven junto a su propia implementacion;
+- las dependencias comunes se centralizan en `comun`;
+- la construccion del dataset GPU queda separada del resto del flujo.
 
 ---
 
-## 14. `kernels.cu`: memoria y calculo en GPU
+## 14. Memoria y calculo CUDA en los modulos actuales
 
 ## 14.1. Memoria usada en este proyecto
 
@@ -1525,6 +1617,15 @@ La cabecera no contiene implementacion, solo contratos.
 | Constante | `d_phase2Threshold` | Configuracion comun de Fase 02 |
 | Compartida | `sharedWindow`, `sharedLocalBest`, `sharedReduction`, `sharedHistogram` | Reducciones e histograma |
 | Host | vectores y mapas C++ | Carga, compactado, impresion |
+
+Aunque el calculo ya no este concentrado en un fichero `kernels.cu`, el uso de
+memoria CUDA sigue siendo el mismo. La diferencia es organizativa:
+
+- `parte1.cu` aloja el kernel de Fase 01;
+- `parte2.cu` aloja el kernel y la memoria constante de Fase 02;
+- `parte3.cu` aloja las cuatro variantes de reduccion;
+- `parte4.cu` aloja el histograma parcial y el merge;
+- `comun.cu` centraliza la configuracion y el cierre post-kernel.
 
 ### Diagrama de memorias
 
@@ -1936,7 +2037,7 @@ flowchart TD
 
 ## 16. Decisiones de implementacion
 
-## 16.1. Globals simples en `main.cu`
+## 16.1. Globals simples compartidas
 
 Se ha elegido un estilo global porque:
 
@@ -2053,15 +2154,15 @@ de lectura recomendada es:
 
 1. `csv_reader.h`
 2. `csv_reader.cpp`
-3. globals y helpers iniciales de `main.cu`
-4. `subirDatasetAGPU`
-5. `kernels.cuh`
-6. `kernels.cu`
-7. `phase01`
-8. `phase02`
-9. `phase03`
-10. `phase04`
-11. `main()`
+3. `comun.cuh`
+4. `comun.cu`
+5. `dataset_gpu.cuh`
+6. `dataset_gpu.cu`
+7. `parte1.cu`
+8. `parte2.cu`
+9. `parte3.cu`
+10. `parte4.cu`
+11. `main.cu`
 
 Ese orden sigue la vida real de los datos: disco -> host -> GPU -> fases ->
 salida.

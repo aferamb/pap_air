@@ -113,11 +113,13 @@ Este resumen no es solo informativo. Tambien ayuda a verificar que el dataset se
 
 ## 4. Arquitectura general de la aplicacion
 
-La aplicacion se divide en tres bloques principales:
+La aplicacion se divide en varios bloques pequenos:
 
-- [`main.cu`](/mnt/c/Users/05jan/Desktop/Tareas/Uni/3_Curso/2_cuatri/Paradigmas_avanzados_de_programacion/Lab/pap_air/PL1_CUDA/src/main.cu): flujo general, consola, subida de datos a GPU y orquestacion de fases.
+- [`main.cu`](/mnt/c/Users/05jan/Desktop/Tareas/Uni/3_Curso/2_cuatri/Paradigmas_avanzados_de_programacion/Lab/pap_air/PL1_CUDA/src/main.cu): consola y flujo principal.
 - [`csv_reader.h`](/mnt/c/Users/05jan/Desktop/Tareas/Uni/3_Curso/2_cuatri/Paradigmas_avanzados_de_programacion/Lab/pap_air/PL1_CUDA/src/csv_reader.h) y [`csv_reader.cpp`](/mnt/c/Users/05jan/Desktop/Tareas/Uni/3_Curso/2_cuatri/Paradigmas_avanzados_de_programacion/Lab/pap_air/PL1_CUDA/src/csv_reader.cpp): lectura y limpieza del CSV.
-- [`kernels.cuh`](/mnt/c/Users/05jan/Desktop/Tareas/Uni/3_Curso/2_cuatri/Paradigmas_avanzados_de_programacion/Lab/pap_air/PL1_CUDA/src/kernels.cuh) y [`kernels.cu`](/mnt/c/Users/05jan/Desktop/Tareas/Uni/3_Curso/2_cuatri/Paradigmas_avanzados_de_programacion/Lab/pap_air/PL1_CUDA/src/kernels.cu): implementacion device de las fases.
+- [`comun.cuh`](/mnt/c/Users/05jan/Desktop/Tareas/Uni/3_Curso/2_cuatri/Paradigmas_avanzados_de_programacion/Lab/pap_air/PL1_CUDA/src/comun.cuh) y [`comun.cu`](/mnt/c/Users/05jan/Desktop/Tareas/Uni/3_Curso/2_cuatri/Paradigmas_avanzados_de_programacion/Lab/pap_air/PL1_CUDA/src/comun.cu): globals, configuracion CUDA y utilidades comunes.
+- [`dataset_gpu.cuh`](/mnt/c/Users/05jan/Desktop/Tareas/Uni/3_Curso/2_cuatri/Paradigmas_avanzados_de_programacion/Lab/pap_air/PL1_CUDA/src/dataset_gpu.cuh) y [`dataset_gpu.cu`](/mnt/c/Users/05jan/Desktop/Tareas/Uni/3_Curso/2_cuatri/Paradigmas_avanzados_de_programacion/Lab/pap_air/PL1_CUDA/src/dataset_gpu.cu): resumen de Fase 0 y preparacion de estructuras persistentes en GPU.
+- [`parte1.cuh`](/mnt/c/Users/05jan/Desktop/Tareas/Uni/3_Curso/2_cuatri/Paradigmas_avanzados_de_programacion/Lab/pap_air/PL1_CUDA/src/parte1.cuh) a [`parte4.cuh`](/mnt/c/Users/05jan/Desktop/Tareas/Uni/3_Curso/2_cuatri/Paradigmas_avanzados_de_programacion/Lab/pap_air/PL1_CUDA/src/parte4.cuh) con sus `.cu` asociados: implementacion de cada fase.
 
 ### 4.1. Flujo general del programa
 
@@ -144,7 +146,7 @@ flowchart TD
 
 ### 4.2. Estado global del programa
 
-En vez de utilizar una gran estructura de estado, `main.cu` mantiene variables globales simples:
+En vez de utilizar una gran estructura de estado, el proyecto mantiene variables globales simples:
 
 - dataset en host: `g_dataset`
 - resumen de carga: `g_summary`
@@ -203,7 +205,7 @@ Se usa en Fase 02 para almacenar el umbral firmado mediante `copyPhase2Threshold
 | Fase 0 | CSV y resumen | Host | Lectura, limpieza y preparacion |
 | Fase 01 | `DEP_DELAY` | Global | Un hilo por fila |
 | Fase 02 | `ARR_DELAY`, `TAIL_NUM`, umbral | Global + Constante | Salida paralela con `atomicAdd` |
-| Fase 03 | Columna elegida compactada a `int` | Global + Compartida | Cuatro variantes |
+| Fase 03 | Columna elegida compactada a `int` | Host + Global temporal + Compartida | Se construye por ejecucion |
 | Fase 04 | Bins densos por `SEQ_ID` | Global + Compartida | Histograma parcial y fusion |
 
 ### 5.6. Operaciones CUDA utilizadas
@@ -264,9 +266,51 @@ No todas las columnas suben a GPU de la misma forma:
 - los `SEQ_ID` de origen y destino se densifican a indices consecutivos;
 - `WEATHER_DELAY` no se mantiene de forma persistente en GPU, porque solo se usa en Fase 03 y se prepara por ejecucion.
 
+Ademas, los buffers densos de Fase 04 solo se reservan y copian si hay
+elementos validos. Si `originDenseInput` o `destinationDenseInput` quedan
+vacios, el programa deja el puntero device en `nullptr` y no hace ni
+`cudaMalloc` ni `cudaMemcpy` para ese caso. Esto no se considera una
+comprobacion de error CUDA, sino una prevencion logica de tamano 0: evita
+reservas/copias innecesarias y permite que Fase 04 detecte de forma directa
+que no hay datos validos para ese histograma.
+
+### 6.4. Que se hace en la carga y que se pospone
+
+Una decision importante de la implementacion es que la carga del CSV **no deja todas las columnas completamente preprocesadas para GPU**.
+
+En la Fase 0 si se hace esto:
+
+- limpiar comillas y espacios;
+- descartar filas demasiado cortas;
+- convertir `SEQ_ID` a `int`, o a `-1` si faltan;
+- convertir `DEP_DELAY`, `ARR_DELAY` y `WEATHER_DELAY` a `float`;
+- guardar esos retrasos como `NAN` cuando faltan o no pueden convertirse;
+- almacenar todo en RAM dentro de `DatasetColumns`.
+
+En cambio, en la carga **no** se hace esto sobre las columnas de retraso:
+
+- no se eliminan todavia los `NAN`;
+- no se compactan las columnas para quitar ausentes;
+- no se truncan todos los valores a `int`.
+
+Por tanto, tras leer el CSV:
+
+- `DEP_DELAY`, `ARR_DELAY` y `WEATHER_DELAY` viven en RAM como `std::vector<float>`;
+- los `NAN` siguen presentes;
+- el truncado a entero se hace mas tarde, segun la fase.
+
+Cada fase resuelve despues su propia preparacion:
+
+- Fase 01: usa `d_depDelay` ya copiado a GPU, ignora `NAN` en el kernel y hace alli el truncado `float -> int`.
+- Fase 02: usa `d_arrDelay` ya copiado a GPU, ignora `NAN` en el kernel y hace alli el truncado `float -> int`.
+- Fase 03: no reutiliza un vector persistente en GPU; elige una columna en RAM, filtra `NAN`, compacta valores validos, los trunca a `int` y solo entonces copia ese vector temporal a GPU.
+- Fase 04: no depende de columnas de retraso, sino de `SEQ_ID` densificados.
+
+Esta separacion entre carga base y preprocesado especifico se eligio para mantener mas simple el estado persistente en GPU. En vez de guardar tambien tres versiones compactadas para Fase 03, el programa conserva el dataset base en RAM y construye su buffer solo cuando esa fase se ejecuta.
+
 #### Linealizacion de `TAIL_NUM`
 
-La funcion `buildTailBuffer(...)` convierte un vector de matriculas de longitud variable en una matriz linealizada de celdas de longitud fija `kPhase2TailNumStride = 16`. Matematicamente, la celda de la fila `i` comienza en:
+La funcion `buildTailBuffer(...)`, implementada en [`dataset_gpu.cu`](/mnt/c/Users/05jan/Desktop/Tareas/Uni/3_Curso/2_cuatri/Paradigmas_avanzados_de_programacion/Lab/pap_air/PL1_CUDA/src/dataset_gpu.cu), convierte un vector de matriculas de longitud variable en una matriz linealizada de celdas de longitud fija `kPhase2TailNumStride = 16`. Matematicamente, la celda de la fila `i` comienza en:
 
 \[
 \text{base}(i) = i \cdot 16
@@ -280,13 +324,21 @@ De esta forma, la matricula de la fila `i` puede recuperarse directamente en GPU
 
 #### Densificacion de `SEQ_ID`
 
-La funcion `buildDenseInput(...)` transforma IDs dispersos en bins consecutivos:
+La funcion `buildDenseInput(...)`, implementada en [`dataset_gpu.cu`](/mnt/c/Users/05jan/Desktop/Tareas/Uni/3_Curso/2_cuatri/Paradigmas_avanzados_de_programacion/Lab/pap_air/PL1_CUDA/src/dataset_gpu.cu), transforma IDs dispersos en bins consecutivos:
 
 \[
 SEQ\_ID \rightarrow denseIndex \in [0, N_{bins}-1]
 \]
 
 Esta aproximacion evita reservar histogramas gigantes por rango bruto de IDs y reduce mucho el consumo de memoria en Fase 04.
+
+Tambien explica por que se mantienen guards como `if (!originDenseInput.empty())`
+o `if (!destinationDenseInput.empty())` en la construccion del dataset GPU. Esos
+guards no son manejo adicional de errores, sino una forma simple de conservar
+la semantica de:
+
+- vector denso vacio -> no se reserva buffer;
+- puntero device nulo -> Fase 04 entiende que no hay entrada valida.
 
 ---
 
@@ -296,7 +348,7 @@ La Fase 01 trabaja con la columna `DEP_DELAY`. Cada hilo procesa una posicion de
 
 ### 7.1. Funcion host
 
-La funcion host es `phase01(int threshold)` en [`main.cu`](/mnt/c/Users/05jan/Desktop/Tareas/Uni/3_Curso/2_cuatri/Paradigmas_avanzados_de_programacion/Lab/pap_air/PL1_CUDA/src/main.cu). Su trabajo es:
+La funcion host es `phase01(int threshold)` en [`parte1.cu`](/mnt/c/Users/05jan/Desktop/Tareas/Uni/3_Curso/2_cuatri/Paradigmas_avanzados_de_programacion/Lab/pap_air/PL1_CUDA/src/parte1.cu). Su trabajo es:
 
 1. calcular la configuracion de lanzamiento con `computeLaunchConfig(...)`;
 2. mostrar por consola la configuracion usada;
@@ -305,7 +357,7 @@ La funcion host es `phase01(int threshold)` en [`main.cu`](/mnt/c/Users/05jan/De
 
 ### 7.2. Kernel device
 
-El kernel implicado es `phase1DepartureDelayKernel(...)` en [`kernels.cu`](/mnt/c/Users/05jan/Desktop/Tareas/Uni/3_Curso/2_cuatri/Paradigmas_avanzados_de_programacion/Lab/pap_air/PL1_CUDA/src/kernels.cu). Su logica es:
+El kernel implicado es `phase1DepartureDelayKernel(...)` en [`parte1.cu`](/mnt/c/Users/05jan/Desktop/Tareas/Uni/3_Curso/2_cuatri/Paradigmas_avanzados_de_programacion/Lab/pap_air/PL1_CUDA/src/parte1.cu). Su logica es:
 
 1. calcular el indice global:
 
@@ -316,7 +368,7 @@ idx = blockIdx.x \cdot blockDim.x + threadIdx.x
 2. comprobar si el hilo esta dentro del rango;
 3. leer el valor `delayValues[idx]`;
 4. ignorar el dato si es `NAN`;
-5. truncar `float` a `int`;
+5. truncar `float` a `int` dentro del propio kernel;
 6. aplicar el filtro firmado.
 
 ### 7.3. Regla matematica del umbral
@@ -358,7 +410,7 @@ La Fase 02 es similar en espiritu a la anterior, pero incluye informacion adicio
 
 ### 8.1. Funcion host
 
-La fase se implementa desde `phase02(int threshold)` en [`main.cu`](/mnt/c/Users/05jan/Desktop/Tareas/Uni/3_Curso/2_cuatri/Paradigmas_avanzados_de_programacion/Lab/pap_air/PL1_CUDA/src/main.cu). Esta funcion realiza:
+La fase se implementa desde `phase02(int threshold)` en [`parte2.cu`](/mnt/c/Users/05jan/Desktop/Tareas/Uni/3_Curso/2_cuatri/Paradigmas_avanzados_de_programacion/Lab/pap_air/PL1_CUDA/src/parte2.cu). Esta funcion realiza:
 
 1. calculo de configuracion de lanzamiento;
 2. inicializacion del contador device con `cudaMemset`;
@@ -389,7 +441,7 @@ El kernel `phase2ArrivalDelayKernel(...)` realiza:
 2. comprobacion de rango;
 3. lectura de `ARR_DELAY`;
 4. descarte si el valor es `NAN`;
-5. truncado a entero;
+5. truncado a entero dentro del kernel;
 6. comparacion con el umbral firmado;
 7. reserva de posicion de salida con `atomicAdd(outCount, 1)`;
 8. copia del retraso a `outDelayValues[outputIndex]`;
@@ -436,11 +488,12 @@ La funcion `phase03(int columnOption, int reductionOption)`:
 2. decide si la reduccion es maximo o minimo;
 3. ignora valores `NAN`;
 4. compacta los datos validos a un `std::vector<int>`;
-5. copia ese vector a GPU;
-6. ejecuta las cuatro variantes;
-7. imprime los cuatro resultados.
+5. trunca esos valores a `int` mientras construye el vector compacto;
+6. copia ese vector temporal a GPU;
+7. ejecuta las cuatro variantes;
+8. imprime los cuatro resultados.
 
-El compactado es importante porque evita que los kernels trabajen con valores no validos. El vector final tiene longitud:
+El compactado es importante porque evita que los kernels trabajen con valores no validos. Ademas, deja claro que Fase 03 no reutiliza una copia persistente ya preparada en GPU, sino un buffer temporal creado en cada ejecucion. El vector final tiene longitud:
 
 \[
 N = \text{numero de elementos validos}
@@ -594,6 +647,16 @@ La fase se lanza desde `phase04(int airportOption, int threshold)`. Esta funcion
 7. copia el histograma final a CPU;
 8. imprime el histograma textual.
 
+Una decision pequena pero importante aqui es que el codigo distingue entre:
+
+- error CUDA real al ejecutar un kernel;
+- ausencia de entrada valida para construir el histograma.
+
+Por eso `phase04(...)` comprueba `totalElements <= 0`, `totalBins <= 0` o
+`denseInput == nullptr`. Esa comprobacion se apoya directamente en la forma en
+que se construyen los buffers densos durante la carga: si un lado no tiene
+ningun aeropuerto valido, ese buffer no se reserva y el puntero permanece nulo.
+
 ### 10.4. Kernel parcial
 
 `phase4SharedHistogramKernel(...)` usa memoria compartida por bloque:
@@ -669,8 +732,12 @@ Aunque la memoria no pretende describir cada linea, si conviene dejar claro el p
 
 - `queryGpuInfo()`: detecta la GPU y sus propiedades.
 - `computeLaunchConfig(...)`: calcula bloques e hilos por bloque.
-- `cudaOk(...)`: compacta la comprobacion de errores CUDA.
 - `executeAndWait(...)`: verifica lanzamiento y sincroniza.
+
+En la version actual ya no existe un helper general `cudaOk(...)` para envolver
+reservas y copias. El unico helper CUDA comun que se mantiene es
+`executeAndWait(...)`, usado despues de cada kernel para detectar errores de
+lanzamiento o de ejecucion.
 
 ### 12.3. Fases
 
@@ -706,7 +773,13 @@ Las columnas reutilizadas por Fases 01, 02 y 04 se suben una sola vez. Esto evit
 
 ### 13.3. `WEATHER_DELAY` solo en host
 
-No se mantiene de forma persistente en GPU porque solo se usa en Fase 03. En este caso resulta mas simple compactar la columna al ejecutar la fase que reservar otra estructura fija innecesaria.
+`WEATHER_DELAY` no se mantiene de forma persistente en GPU. De hecho, la entrada real de Fase 03 no es solo `WEATHER_DELAY`, sino una columna elegida entre tres (`DEP_DELAY`, `ARR_DELAY` o `WEATHER_DELAY`) que ademas debe:
+
+- filtrar `NAN`;
+- compactar solo valores validos;
+- truncarse a `int`.
+
+Por eso la implementacion no deja en GPU una version fija de Fase 03 desde la carga inicial. El dataset base se conserva en RAM y la fase construye su propio buffer temporal cuando el usuario la ejecuta. Es una decision de simplicidad y de control del estado persistente en GPU.
 
 ### 13.4. Umbral firmado en Fases 01 y 02
 
