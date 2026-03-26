@@ -12,8 +12,7 @@
     practica:
 
     - las columnas reales de las Fases 01, 02, 03 y 04;
-    - un resumen pequeno de la carga;
-    - helpers minimos de parseo del CSV.
+    - un resumen pequeno de la carga.
 
     La cabecera ya no intenta describir un lector generico. El CSV de la
     practica es fijo y conocido, asi que la carga se apoya en indices de
@@ -74,36 +73,6 @@ struct LoadSummary {
 };
 
 /*
-    splitCsvLineSimple
-
-    Parser CSV pequeno y suficiente para este dataset. Soporta campos vacios y
-    comillas simples. No pretende cubrir todo el estandar CSV.
-*/
-std::vector<std::string> splitCsvLineSimple(const std::string& line);
-
-/*
-    cleanQuotedToken
-
-    Limpia espacios exteriores y elimina comillas envolventes basicas.
-*/
-std::string cleanQuotedToken(const std::string& token);
-
-/*
-    parseFloatOrNan
-
-    Convierte un token a float. Si el dato falta o es invalido, devuelve NAN.
-*/
-float parseFloatOrNan(const std::string& token);
-
-/*
-    parseIntFromFloatToken
-
-    Convierte un token decimal del CSV a entero truncado. Si falta o no es
-    valido, devuelve false y deja -1 en parsedValue.
-*/
-bool parseIntFromFloatToken(const std::string& token, int& parsedValue);
-
-/*
     loadDataset
 
     Carga el CSV, limpia los campos necesarios y deja el dataset y su resumen
@@ -115,10 +84,3 @@ bool loadDataset(
     DatasetColumns& dataset,
     LoadSummary& summary,
     std::string& errorMessage);
-
-/*
-    getDatasetRowCount
-
-    Devuelve el numero de filas utiles del dataset ya cargado.
-*/
-std::size_t getDatasetRowCount(const DatasetColumns& dataset);

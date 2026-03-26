@@ -161,7 +161,6 @@ bool parseIntFromFloatToken(const std::string& token, int& parsedValue)
     parsedValue = static_cast<int>(parsedFloat);
     return true;
 }
-
 bool loadDataset(
     const std::string& filename,
     DatasetColumns& dataset,
@@ -273,9 +272,4 @@ bool loadDataset(
     }
 
     return true;
-}
-
-std::size_t getDatasetRowCount(const DatasetColumns& dataset)
-{
-    return dataset.depDelay.size();
 }

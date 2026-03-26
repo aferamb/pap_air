@@ -11,9 +11,12 @@ El proyecto implementa la practica completa sobre el **US Airline Dataset**:
   `ARR_DELAY` y `WEATHER_DELAY`.
 - **Fase 04**: histograma CUDA de aeropuertos por `SEQ_ID`.
 
-La version actual se ha simplificado para reducir codigo host y evitar copias
-repetidas. Las Fases 01, 02 y 04 reutilizan un **dataset persistente en GPU**
-que se construye una sola vez al cargar el CSV.
+La version actual se ha simplificado sobre todo en `main.cu`:
+
+- estado host/device en globals simples;
+- menos structs de orquestacion;
+- menos paso de informacion entre funciones;
+- un unico dataset en GPU para Fases 01, 02 y 04.
 
 ---
 
@@ -27,9 +30,9 @@ que se construye una sola vez al cargar el CSV.
   - contienen los kernels de Fases 01, 02, 03 y 04.
 - `PL1_CUDA/src/main.cu`
   - coordina la aplicacion;
-  - mantiene el estado global;
   - contiene toda la interfaz de consola;
-  - construye el dataset persistente de GPU;
+  - guarda el estado global host/device;
+  - sube el dataset util a GPU una sola vez;
   - ejecuta todas las fases.
 
 Dataset de ejemplo:
@@ -80,7 +83,7 @@ que mantener dos columnas string completas por fila.
 2. Se detecta la GPU CUDA.
 3. Se pide la ruta del CSV.
 4. `loadDataset(...)` carga el fichero en host.
-5. Si hay GPU, `buildDeviceDataset(...)` crea el dataset persistente.
+5. Si hay GPU, `subirDatasetAGPU(...)` copia las columnas y buffers que se reutilizan.
 6. Se muestra un resumen corto de carga y CUDA.
 7. El programa entra en el menu principal.
 
@@ -93,8 +96,8 @@ flowchart TD
     C --> D[Prompt inline de ruta CSV]
     D --> E[loadDataset]
     E --> F{GPU disponible?}
-    F -- Si --> G[buildDeviceDataset]
-    F -- No --> H[Guardar dataset en AppState]
+    F -- Si --> G[subirDatasetAGPU]
+    F -- No --> H[Guardar dataset en globals]
     G --> H
     H --> I[Menu principal]
     I --> J[Fase 01]
@@ -110,7 +113,7 @@ flowchart TD
 - La captura del menu, de la ruta del CSV y de los parametros de cada fase
   vive inline dentro de `main.cu`, sin helpers de CLI separados.
 - `loadDataset(...)` deja el dataset limpio en memoria del host.
-- `buildDeviceDataset(...)` copia solo lo que conviene reutilizar muchas veces:
+- `subirDatasetAGPU(...)` copia solo lo que conviene reutilizar muchas veces:
   - `DEP_DELAY`
   - `ARR_DELAY`
   - `TAIL_NUM`
@@ -121,9 +124,9 @@ flowchart TD
 
 ---
 
-## Dataset persistente en GPU
+## Dataset cargado en GPU
 
-El dataset persistente en GPU existe para evitar repetir `cudaMalloc` y
+El dataset cargado en GPU existe para evitar repetir `cudaMalloc` y
 `cudaMemcpy` en cada ejecucion de fase.
 
 ### Que guarda
@@ -200,7 +203,7 @@ cuatro variantes seguidas.
 - lectura del CSV;
 - limpieza basica de texto y numeros;
 - construccion del resumen de carga;
-- construccion inicial del dataset persistente;
+- subida inicial del dataset util a GPU;
 - compactado de datos para la Fase 03;
 - impresion del histograma textual de la Fase 04;
 - menu y captura de parametros.

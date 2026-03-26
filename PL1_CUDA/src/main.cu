@@ -17,17 +17,20 @@
 /*
     main.cu
 
-    Esta version compacta el host en torno a tres ideas:
+    Esta version quita gran parte del pegamento anterior y se acerca mas al
+    estilo de cudasergi:
 
-    - una CLI centralizada en este archivo, pero con helpers pequenos;
-    - un dataset persistente en GPU que se construye una sola vez al cargar;
-    - menos pegamento repetido alrededor de los lanzamientos CUDA.
+    - estado host/device guardado en globals simples;
+    - dataset util subido una sola vez a GPU;
+    - menos structs de orquestacion;
+    - menos firmas largas pasando estado de un lado a otro.
 
-    Se mantiene la funcionalidad importante de la practica:
+    Se mantiene lo importante de la practica:
 
-    - Fase 01 sobre DEP_DELAY;
-    - Fase 02 sobre ARR_DELAY + TAIL_NUM con memoria constante y atomicas;
-    - Fase 03 completa con sus cuatro variantes y WEATHER_DELAY;
+    - Fase 01 con DEP_DELAY;
+    - Fase 02 con ARR_DELAY, TAIL_NUM, memoria constante y resumen CPU;
+    - Fase 03 con DEP_DELAY, ARR_DELAY, WEATHER_DELAY y sus cuatro variantes;
+    - Fase 03.4 iterando hasta dejar 10 valores o menos;
     - Fase 04 con bins densos por SEQ_ID y memoria compartida.
 */
 
@@ -36,109 +39,10 @@
         if (!cudaOk((call), #call)) return false; \
     } while (0)
 
-/*
-    Opciones de menu y tipos pequenos de seleccion.
-
-    Se mantienen como enums simples para que el flujo del programa siga siendo
-    legible sin recurrir a cadenas magicas.
-*/
-enum class MainMenuOption {
-    Phase1,
-    Phase2,
-    Phase3,
-    Phase4,
-    ReloadCsv,
-    ShowStatus,
-    Exit
-};
-
-enum class Phase3ColumnOption {
-    DepartureDelay = 1,
-    ArrivalDelay = 2,
-    WeatherDelay = 3
-};
-
-enum class ReductionTypeOption {
-    Maximum = 1,
-    Minimum = 2
-};
-
-enum class HistogramAirportTypeOption {
-    Origin = 1,
-    Destination = 2
-};
-
-/*
-    LaunchConfig
-
-    Estructura minima para describir el lanzamiento 1D que se muestra y se usa
-    en las fases CUDA.
-*/
 struct LaunchConfig {
     int blocks = 0;
     int threadsPerBlock = 1;
 };
-
-/*
-    DeviceDataset
-
-    Representa el dataset persistente en GPU. La idea es guardar aqui solo la
-    informacion que se reutiliza de verdad muchas veces:
-
-    - DEP_DELAY para Fase 01;
-    - ARR_DELAY y TAIL_NUM para Fase 02;
-    - bins densos de origen y destino para Fase 04;
-    - buffers de salida persistentes de Fase 02.
-
-    WEATHER_DELAY no se sube aqui de forma fija porque Fase 03 sigue
-    construyendo su vector compacto segun la columna elegida.
-*/
-struct DeviceDataset {
-    int rowCount = 0;
-
-    float* d_depDelay = nullptr;
-    float* d_arrDelay = nullptr;
-    char* d_tailNums = nullptr;
-
-    int* d_phase2Count = nullptr;
-    int* d_phase2OutDelayValues = nullptr;
-    char* d_phase2OutTailNums = nullptr;
-
-    int* d_originDenseInput = nullptr;
-    int originTotalElements = 0;
-    int originTotalBins = 0;
-    std::vector<int> originDenseToSeqId;
-
-    int* d_destinationDenseInput = nullptr;
-    int destinationTotalElements = 0;
-    int destinationTotalBins = 0;
-    std::vector<int> destinationDenseToSeqId;
-};
-
-/*
-    AppState
-
-    Estado vivo de la aplicacion:
-
-    - ruta activa del CSV;
-    - dataset limpio en host;
-    - resumen de la Fase 0;
-    - informacion CUDA;
-    - copia persistente del dataset util en GPU.
-*/
-struct AppState {
-    std::string datasetPath;
-    bool datasetLoaded = false;
-    DatasetColumns dataset;
-    LoadSummary summary;
-
-    bool deviceReady = false;
-    cudaDeviceProp deviceProp{};
-    std::string deviceErrorMessage;
-    DeviceDataset device;
-};
-
-namespace {
 
 enum class Phase3AtomicVariant {
     Simple,
@@ -147,7 +51,44 @@ enum class Phase3AtomicVariant {
 };
 
 /*
-    Helpers genericos pequenos
+    Estado global del programa.
+
+    Se deja en globals a proposito para reducir tipado y evitar pasar structs
+    grandes entre funciones.
+*/
+DatasetColumns g_dataset;
+LoadSummary g_summary;
+std::string g_datasetPath;
+bool g_datasetLoaded = false;
+
+bool g_deviceReady = false;
+cudaDeviceProp g_deviceProp{};
+std::string g_deviceErrorMessage;
+
+int g_rowCount = 0;
+
+float* d_depDelay = nullptr;
+float* d_arrDelay = nullptr;
+char* d_tailNums = nullptr;
+
+int* d_phase2Count = nullptr;
+int* d_phase2OutDelayValues = nullptr;
+char* d_phase2OutTailNums = nullptr;
+
+int* d_originDenseInput = nullptr;
+int g_originTotalElements = 0;
+int g_originTotalBins = 0;
+std::vector<int> g_originDenseToSeqId;
+
+int* d_destinationDenseInput = nullptr;
+int g_destinationTotalElements = 0;
+int g_destinationTotalBins = 0;
+std::vector<int> g_destinationDenseToSeqId;
+
+namespace {
+
+/*
+    Helpers pequenos de texto y consola
 */
 
 std::string trimWhitespace(const std::string& text)
@@ -175,26 +116,6 @@ bool fileExists(const std::string& path)
 bool isCancelToken(const std::string& input)
 {
     return input == "x" || input == "X";
-}
-
-bool cudaOk(cudaError_t status, const char* context)
-{
-    if (status == cudaSuccess) {
-        return true;
-    }
-
-    std::cout << "Error CUDA en " << context << ": "
-              << cudaGetErrorString(status) << "\n";
-    return false;
-}
-
-bool finishKernel(const char* context)
-{
-    if (!cudaOk(cudaGetLastError(), context)) {
-        return false;
-    }
-
-    return cudaOk(cudaDeviceSynchronize(), context);
 }
 
 void pauseForEnter()
@@ -260,39 +181,64 @@ bool readSignedThreshold(const char* prompt, int& value)
 }
 
 /*
-    Helpers de configuracion y comparacion
+    Helpers CUDA pequenos
 */
 
-bool queryGpuInfo(cudaDeviceProp& deviceProp, std::string& errorMessage)
+bool cudaOk(cudaError_t status, const char* context)
+{
+    if (status == cudaSuccess) {
+        return true;
+    }
+
+    std::cout << "Error CUDA en " << context << ": "
+              << cudaGetErrorString(status) << "\n";
+    return false;
+}
+
+bool ejecutarKernelYEsperar(const char* context)
+{
+    if (!cudaOk(cudaGetLastError(), context)) {
+        return false;
+    }
+
+    return cudaOk(cudaDeviceSynchronize(), context);
+}
+
+bool queryGpuInfo()
 {
     int deviceCount = 0;
     const cudaError_t countStatus = cudaGetDeviceCount(&deviceCount);
 
     if (countStatus != cudaSuccess) {
-        errorMessage = cudaGetErrorString(countStatus);
+        g_deviceReady = false;
+        g_deviceErrorMessage = cudaGetErrorString(countStatus);
         return false;
     }
 
     if (deviceCount <= 0) {
-        errorMessage = "No se ha detectado ninguna GPU CUDA accesible.";
+        g_deviceReady = false;
+        g_deviceErrorMessage = "No se ha detectado ninguna GPU CUDA accesible.";
         return false;
     }
 
-    const cudaError_t propertyStatus = cudaGetDeviceProperties(&deviceProp, 0);
+    const cudaError_t propertyStatus = cudaGetDeviceProperties(&g_deviceProp, 0);
 
     if (propertyStatus != cudaSuccess) {
-        errorMessage = cudaGetErrorString(propertyStatus);
+        g_deviceReady = false;
+        g_deviceErrorMessage = cudaGetErrorString(propertyStatus);
         return false;
     }
 
+    g_deviceReady = true;
+    g_deviceErrorMessage.clear();
     return true;
 }
 
-LaunchConfig computeLaunchConfig(int totalElements, const cudaDeviceProp& deviceProp)
+LaunchConfig computeLaunchConfig(int totalElements)
 {
     LaunchConfig launchConfig;
+    const int maxThreads = g_deviceProp.maxThreadsPerBlock > 0 ? g_deviceProp.maxThreadsPerBlock : 1;
 
-    const int maxThreads = deviceProp.maxThreadsPerBlock > 0 ? deviceProp.maxThreadsPerBlock : 1;
     launchConfig.threadsPerBlock = maxThreads < 256 ? maxThreads : 256;
 
     if (totalElements > 0) {
@@ -302,35 +248,8 @@ LaunchConfig computeLaunchConfig(int totalElements, const cudaDeviceProp& device
     return launchConfig;
 }
 
-int getReductionIdentity(bool isMax)
-{
-    return isMax ? INT_MIN : INT_MAX;
-}
-
-int hostCompareReduction(int left, int right, bool isMax)
-{
-    if (isMax) {
-        return left > right ? left : right;
-    }
-
-    return left < right ? left : right;
-}
-
-const std::vector<float>& selectPhase3Column(const DatasetColumns& dataset, Phase3ColumnOption columnOption)
-{
-    switch (columnOption) {
-    case Phase3ColumnOption::ArrivalDelay:
-        return dataset.arrDelay;
-    case Phase3ColumnOption::WeatherDelay:
-        return dataset.weatherDelay;
-    case Phase3ColumnOption::DepartureDelay:
-    default:
-        return dataset.depDelay;
-    }
-}
-
 /*
-    Construccion y liberacion del dataset persistente en GPU
+    Construccion y liberacion del dataset GPU
 */
 
 void buildTailBuffer(const std::vector<std::string>& source, std::vector<char>& outBuffer)
@@ -340,7 +259,6 @@ void buildTailBuffer(const std::vector<std::string>& source, std::vector<char>& 
     for (std::size_t row = 0; row < source.size(); ++row) {
         const std::string& tailNum = source[row];
         char* cell = &outBuffer[row * kPhase2TailNumStride];
-
         const std::size_t maxCharacters = static_cast<std::size_t>(kPhase2TailNumStride - 1);
         const std::size_t charactersToCopy = tailNum.size() < maxCharacters ? tailNum.size() : maxCharacters;
 
@@ -374,243 +292,245 @@ void buildDenseInput(
         std::unordered_map<int, int>::const_iterator found = denseIndexBySeqId.find(seqId);
 
         if (found == denseIndexBySeqId.end()) {
-            const int nextDenseIndex = static_cast<int>(denseToSeqId.size());
-            denseIndexBySeqId[seqId] = nextDenseIndex;
+            const int denseIndex = static_cast<int>(denseToSeqId.size());
+            denseIndexBySeqId[seqId] = denseIndex;
             denseToSeqId.push_back(seqId);
-            denseInput.push_back(nextDenseIndex);
+            denseInput.push_back(denseIndex);
         } else {
             denseInput.push_back(found->second);
         }
     }
 }
 
-void releaseDeviceDataset(DeviceDataset& device)
+void liberarGPU()
 {
-    auto freeIfNeeded = [](void* ptr) {
-        if (ptr != nullptr) {
-            cudaFree(ptr);
-        }
-    };
+    if (d_depDelay != nullptr) {
+        cudaFree(d_depDelay);
+        d_depDelay = nullptr;
+    }
 
-    freeIfNeeded(device.d_depDelay);
-    freeIfNeeded(device.d_arrDelay);
-    freeIfNeeded(device.d_tailNums);
-    freeIfNeeded(device.d_phase2Count);
-    freeIfNeeded(device.d_phase2OutDelayValues);
-    freeIfNeeded(device.d_phase2OutTailNums);
-    freeIfNeeded(device.d_originDenseInput);
-    freeIfNeeded(device.d_destinationDenseInput);
+    if (d_arrDelay != nullptr) {
+        cudaFree(d_arrDelay);
+        d_arrDelay = nullptr;
+    }
 
-    device = DeviceDataset{};
+    if (d_tailNums != nullptr) {
+        cudaFree(d_tailNums);
+        d_tailNums = nullptr;
+    }
+
+    if (d_phase2Count != nullptr) {
+        cudaFree(d_phase2Count);
+        d_phase2Count = nullptr;
+    }
+
+    if (d_phase2OutDelayValues != nullptr) {
+        cudaFree(d_phase2OutDelayValues);
+        d_phase2OutDelayValues = nullptr;
+    }
+
+    if (d_phase2OutTailNums != nullptr) {
+        cudaFree(d_phase2OutTailNums);
+        d_phase2OutTailNums = nullptr;
+    }
+
+    if (d_originDenseInput != nullptr) {
+        cudaFree(d_originDenseInput);
+        d_originDenseInput = nullptr;
+    }
+
+    if (d_destinationDenseInput != nullptr) {
+        cudaFree(d_destinationDenseInput);
+        d_destinationDenseInput = nullptr;
+    }
+
+    g_rowCount = 0;
+    g_originTotalElements = 0;
+    g_originTotalBins = 0;
+    g_destinationTotalElements = 0;
+    g_destinationTotalBins = 0;
+    g_originDenseToSeqId.clear();
+    g_destinationDenseToSeqId.clear();
 }
 
-bool buildDeviceDataset(const DatasetColumns& dataset, DeviceDataset& device, std::string& errorMessage)
+bool subirDatasetAGPU(const DatasetColumns& dataset, std::string& errorMessage)
 {
-    DeviceDataset newDevice;
-    newDevice.rowCount = static_cast<int>(getDatasetRowCount(dataset));
+    /*
+        Sube a GPU solo lo que se reutiliza entre fases:
 
-    if (newDevice.rowCount <= 0) {
-        errorMessage = "No hay filas validas para construir el dataset persistente en GPU.";
+        - DEP_DELAY para Fase 01;
+        - ARR_DELAY y TAIL_NUM para Fase 02;
+        - entradas densas de origen y destino para Fase 04;
+        - buffers persistentes de salida para Fase 02.
+    */
+    const int rowCount = static_cast<int>(dataset.depDelay.size());
+
+    if (rowCount <= 0) {
+        errorMessage = "No hay filas validas para construir el dataset en GPU.";
         return false;
     }
 
     std::vector<char> tailBuffer;
     std::vector<int> originDenseInput;
     std::vector<int> destinationDenseInput;
+    std::vector<int> originDenseToSeqId;
+    std::vector<int> destinationDenseToSeqId;
 
     buildTailBuffer(dataset.tailNum, tailBuffer);
-    buildDenseInput(dataset.originSeqId, dataset.originIdToCode, newDevice.originDenseToSeqId, originDenseInput);
-    buildDenseInput(dataset.destSeqId, dataset.destIdToCode, newDevice.destinationDenseToSeqId, destinationDenseInput);
+    buildDenseInput(dataset.originSeqId, dataset.originIdToCode, originDenseToSeqId, originDenseInput);
+    buildDenseInput(dataset.destSeqId, dataset.destIdToCode, destinationDenseToSeqId, destinationDenseInput);
 
-    newDevice.originTotalElements = static_cast<int>(originDenseInput.size());
-    newDevice.originTotalBins = static_cast<int>(newDevice.originDenseToSeqId.size());
-    newDevice.destinationTotalElements = static_cast<int>(destinationDenseInput.size());
-    newDevice.destinationTotalBins = static_cast<int>(newDevice.destinationDenseToSeqId.size());
+    liberarGPU();
 
-    const std::size_t delayBytes = static_cast<std::size_t>(newDevice.rowCount) * sizeof(float);
+    const std::size_t delayBytes = static_cast<std::size_t>(rowCount) * sizeof(float);
     const std::size_t tailBytes = tailBuffer.size() * sizeof(char);
-    const std::size_t outDelayBytes = static_cast<std::size_t>(newDevice.rowCount) * sizeof(int);
-    const std::size_t outTailBytes = static_cast<std::size_t>(newDevice.rowCount) * kPhase2TailNumStride * sizeof(char);
+    const std::size_t outDelayBytes = static_cast<std::size_t>(rowCount) * sizeof(int);
+    const std::size_t outTailBytes = static_cast<std::size_t>(rowCount) * kPhase2TailNumStride * sizeof(char);
 
-    auto fail = [&](const char* context, cudaError_t status) {
-        errorMessage = std::string(context) + ": " + cudaGetErrorString(status);
-        releaseDeviceDataset(newDevice);
-        return false;
-    };
-
-    auto allocate = [&](void** pointer, std::size_t bytes, const char* context) {
-        const cudaError_t status = cudaMalloc(pointer, bytes);
-
-        if (status != cudaSuccess) {
-            return fail(context, status);
-        }
-
-        return true;
-    };
-
-    auto upload = [&](void* destination, const void* source, std::size_t bytes, const char* context) {
-        const cudaError_t status = cudaMemcpy(destination, source, bytes, cudaMemcpyHostToDevice);
-
-        if (status != cudaSuccess) {
-            return fail(context, status);
-        }
-
-        return true;
-    };
-
-    if (!allocate(reinterpret_cast<void**>(&newDevice.d_depDelay), delayBytes, "cudaMalloc d_depDelay")) {
+    if (!cudaOk(cudaMalloc(reinterpret_cast<void**>(&d_depDelay), delayBytes), "cudaMalloc d_depDelay") ||
+        !cudaOk(cudaMalloc(reinterpret_cast<void**>(&d_arrDelay), delayBytes), "cudaMalloc d_arrDelay") ||
+        !cudaOk(cudaMalloc(reinterpret_cast<void**>(&d_tailNums), tailBytes), "cudaMalloc d_tailNums") ||
+        !cudaOk(cudaMalloc(reinterpret_cast<void**>(&d_phase2Count), sizeof(int)), "cudaMalloc d_phase2Count") ||
+        !cudaOk(cudaMalloc(reinterpret_cast<void**>(&d_phase2OutDelayValues), outDelayBytes), "cudaMalloc d_phase2OutDelayValues") ||
+        !cudaOk(cudaMalloc(reinterpret_cast<void**>(&d_phase2OutTailNums), outTailBytes), "cudaMalloc d_phase2OutTailNums")) {
+        liberarGPU();
+        errorMessage = "No se ha podido reservar la memoria principal de GPU.";
         return false;
     }
 
-    if (!allocate(reinterpret_cast<void**>(&newDevice.d_arrDelay), delayBytes, "cudaMalloc d_arrDelay")) {
-        return false;
-    }
-
-    if (!allocate(reinterpret_cast<void**>(&newDevice.d_tailNums), tailBytes, "cudaMalloc d_tailNums")) {
-        return false;
-    }
-
-    if (!allocate(reinterpret_cast<void**>(&newDevice.d_phase2Count), sizeof(int), "cudaMalloc d_phase2Count")) {
-        return false;
-    }
-
-    if (!allocate(
-            reinterpret_cast<void**>(&newDevice.d_phase2OutDelayValues),
-            outDelayBytes,
-            "cudaMalloc d_phase2OutDelayValues")) {
-        return false;
-    }
-
-    if (!allocate(
-            reinterpret_cast<void**>(&newDevice.d_phase2OutTailNums),
-            outTailBytes,
-            "cudaMalloc d_phase2OutTailNums")) {
-        return false;
-    }
-
-    if (newDevice.originTotalElements > 0 &&
-        !allocate(
-            reinterpret_cast<void**>(&newDevice.d_originDenseInput),
-            static_cast<std::size_t>(newDevice.originTotalElements) * sizeof(int),
+    if (!originDenseInput.empty() &&
+        !cudaOk(
+            cudaMalloc(
+                reinterpret_cast<void**>(&d_originDenseInput),
+                static_cast<std::size_t>(originDenseInput.size()) * sizeof(int)),
             "cudaMalloc d_originDenseInput")) {
+        liberarGPU();
+        errorMessage = "No se ha podido reservar d_originDenseInput.";
         return false;
     }
 
-    if (newDevice.destinationTotalElements > 0 &&
-        !allocate(
-            reinterpret_cast<void**>(&newDevice.d_destinationDenseInput),
-            static_cast<std::size_t>(newDevice.destinationTotalElements) * sizeof(int),
+    if (!destinationDenseInput.empty() &&
+        !cudaOk(
+            cudaMalloc(
+                reinterpret_cast<void**>(&d_destinationDenseInput),
+                static_cast<std::size_t>(destinationDenseInput.size()) * sizeof(int)),
             "cudaMalloc d_destinationDenseInput")) {
+        liberarGPU();
+        errorMessage = "No se ha podido reservar d_destinationDenseInput.";
         return false;
     }
 
-    if (!upload(newDevice.d_depDelay, dataset.depDelay.data(), delayBytes, "cudaMemcpy H2D d_depDelay")) {
+    if (!cudaOk(cudaMemcpy(d_depDelay, dataset.depDelay.data(), delayBytes, cudaMemcpyHostToDevice), "cudaMemcpy H2D d_depDelay") ||
+        !cudaOk(cudaMemcpy(d_arrDelay, dataset.arrDelay.data(), delayBytes, cudaMemcpyHostToDevice), "cudaMemcpy H2D d_arrDelay") ||
+        !cudaOk(cudaMemcpy(d_tailNums, tailBuffer.data(), tailBytes, cudaMemcpyHostToDevice), "cudaMemcpy H2D d_tailNums")) {
+        liberarGPU();
+        errorMessage = "No se han podido copiar las columnas base a GPU.";
         return false;
     }
 
-    if (!upload(newDevice.d_arrDelay, dataset.arrDelay.data(), delayBytes, "cudaMemcpy H2D d_arrDelay")) {
-        return false;
-    }
-
-    if (!upload(newDevice.d_tailNums, tailBuffer.data(), tailBytes, "cudaMemcpy H2D d_tailNums")) {
-        return false;
-    }
-
-    if (newDevice.originTotalElements > 0 &&
-        !upload(
-            newDevice.d_originDenseInput,
-            originDenseInput.data(),
-            static_cast<std::size_t>(newDevice.originTotalElements) * sizeof(int),
+    if (!originDenseInput.empty() &&
+        !cudaOk(
+            cudaMemcpy(
+                d_originDenseInput,
+                originDenseInput.data(),
+                static_cast<std::size_t>(originDenseInput.size()) * sizeof(int),
+                cudaMemcpyHostToDevice),
             "cudaMemcpy H2D d_originDenseInput")) {
+        liberarGPU();
+        errorMessage = "No se ha podido copiar d_originDenseInput.";
         return false;
     }
 
-    if (newDevice.destinationTotalElements > 0 &&
-        !upload(
-            newDevice.d_destinationDenseInput,
-            destinationDenseInput.data(),
-            static_cast<std::size_t>(newDevice.destinationTotalElements) * sizeof(int),
+    if (!destinationDenseInput.empty() &&
+        !cudaOk(
+            cudaMemcpy(
+                d_destinationDenseInput,
+                destinationDenseInput.data(),
+                static_cast<std::size_t>(destinationDenseInput.size()) * sizeof(int),
+                cudaMemcpyHostToDevice),
             "cudaMemcpy H2D d_destinationDenseInput")) {
+        liberarGPU();
+        errorMessage = "No se ha podido copiar d_destinationDenseInput.";
         return false;
     }
 
-    releaseDeviceDataset(device);
-    device = newDevice;
+    g_rowCount = rowCount;
+    g_originTotalElements = static_cast<int>(originDenseInput.size());
+    g_originTotalBins = static_cast<int>(originDenseToSeqId.size());
+    g_destinationTotalElements = static_cast<int>(destinationDenseInput.size());
+    g_destinationTotalBins = static_cast<int>(destinationDenseToSeqId.size());
+    g_originDenseToSeqId = std::move(originDenseToSeqId);
+    g_destinationDenseToSeqId = std::move(destinationDenseToSeqId);
+
     errorMessage.clear();
     return true;
 }
 
 /*
-    Resumenes de estado
+    Resumenes y estado
 */
 
-void printLoadSummary(const AppState& appState)
+void printLoadSummary()
 {
     std::cout << "\n=== Fase 0 ===\n";
-    std::cout << "Ruta: " << appState.datasetPath << "\n";
-    std::cout << "Filas de datos leidas: " << appState.summary.rowsRead << "\n";
-    std::cout << "Filas almacenadas: " << appState.summary.storedRows << "\n";
-    std::cout << "Filas descartadas: " << appState.summary.discardedRows << "\n";
+    std::cout << "Ruta: " << g_datasetPath << "\n";
+    std::cout << "Filas de datos leidas: " << g_summary.rowsRead << "\n";
+    std::cout << "Filas almacenadas: " << g_summary.storedRows << "\n";
+    std::cout << "Filas descartadas: " << g_summary.discardedRows << "\n";
 
     std::cout << "\nValores ausentes detectados:\n";
-    std::cout << "- TAIL_NUM: " << appState.summary.missingTailNum << "\n";
-    std::cout << "- ORIGIN_SEQ_ID: " << appState.summary.missingOriginSeqId << "\n";
-    std::cout << "- ORIGIN_AIRPORT: " << appState.summary.missingOriginAirportCode << "\n";
-    std::cout << "- DEST_SEQ_ID: " << appState.summary.missingDestSeqId << "\n";
-    std::cout << "- DEST_AIRPORT: " << appState.summary.missingDestAirportCode << "\n";
-    std::cout << "- DEP_DELAY: " << appState.summary.missingDepDelay << "\n";
-    std::cout << "- ARR_DELAY: " << appState.summary.missingArrDelay << "\n";
-    std::cout << "- WEATHER_DELAY: " << appState.summary.missingWeatherDelay << "\n";
+    std::cout << "- TAIL_NUM: " << g_summary.missingTailNum << "\n";
+    std::cout << "- ORIGIN_SEQ_ID: " << g_summary.missingOriginSeqId << "\n";
+    std::cout << "- ORIGIN_AIRPORT: " << g_summary.missingOriginAirportCode << "\n";
+    std::cout << "- DEST_SEQ_ID: " << g_summary.missingDestSeqId << "\n";
+    std::cout << "- DEST_AIRPORT: " << g_summary.missingDestAirportCode << "\n";
+    std::cout << "- DEP_DELAY: " << g_summary.missingDepDelay << "\n";
+    std::cout << "- ARR_DELAY: " << g_summary.missingArrDelay << "\n";
+    std::cout << "- WEATHER_DELAY: " << g_summary.missingWeatherDelay << "\n";
 
     std::cout << "\nCategorias detectadas:\n";
-    std::cout << "- Aeropuertos unicos de origen por SEQ_ID: "
-              << appState.summary.uniqueOriginSeqIds << "\n";
-    std::cout << "- Aeropuertos unicos de destino por SEQ_ID: "
-              << appState.summary.uniqueDestinationSeqIds << "\n";
+    std::cout << "- Aeropuertos unicos de origen por SEQ_ID: " << g_summary.uniqueOriginSeqIds << "\n";
+    std::cout << "- Aeropuertos unicos de destino por SEQ_ID: " << g_summary.uniqueDestinationSeqIds << "\n";
 }
 
-void printGpuSummary(const AppState& appState)
+void printGpuSummary()
 {
     std::cout << "\n=== CUDA ===\n";
 
-    if (!appState.deviceReady) {
-        std::cout << "No disponible: " << appState.deviceErrorMessage << "\n";
+    if (!g_deviceReady) {
+        std::cout << "No disponible: " << g_deviceErrorMessage << "\n";
         return;
     }
 
     const unsigned long long globalMemoryInMb =
-        static_cast<unsigned long long>(appState.deviceProp.totalGlobalMem) / (1024ULL * 1024ULL);
+        static_cast<unsigned long long>(g_deviceProp.totalGlobalMem) / (1024ULL * 1024ULL);
     const unsigned long long sharedMemoryInKb =
-        static_cast<unsigned long long>(appState.deviceProp.sharedMemPerBlock) / 1024ULL;
+        static_cast<unsigned long long>(g_deviceProp.sharedMemPerBlock) / 1024ULL;
 
-    std::cout << "GPU: " << appState.deviceProp.name
-              << " | CC " << appState.deviceProp.major << "." << appState.deviceProp.minor << "\n";
+    std::cout << "GPU: " << g_deviceProp.name
+              << " | CC " << g_deviceProp.major << "." << g_deviceProp.minor << "\n";
     std::cout << "Global: " << globalMemoryInMb << " MB"
               << " | Shared por bloque: " << sharedMemoryInKb << " KB"
-              << " | Max hilos/bloque: " << appState.deviceProp.maxThreadsPerBlock << "\n";
+              << " | Max hilos/bloque: " << g_deviceProp.maxThreadsPerBlock << "\n";
 
-    if (appState.datasetLoaded) {
-        const LaunchConfig launchConfig = computeLaunchConfig(static_cast<int>(getDatasetRowCount(appState.dataset)), appState.deviceProp);
+    if (g_datasetLoaded) {
+        const LaunchConfig launchConfig = computeLaunchConfig(static_cast<int>(g_dataset.depDelay.size()));
 
         std::cout << "Sugerencia base: " << launchConfig.blocks
                   << " bloques x " << launchConfig.threadsPerBlock << " hilos\n";
 
-        if (appState.device.rowCount > 0) {
-            std::cout << "Dataset persistente en GPU listo para Fases 01, 02 y 04.\n";
+        if (g_rowCount > 0) {
+            std::cout << "Dataset cargado en GPU para Fases 01, 02 y 04.\n";
         }
     }
 }
 
 /*
-    Carga del dataset y preparacion del estado
+    Carga del dataset
 */
 
-bool loadDatasetIntoState(AppState& appState, const std::string& datasetPath)
+bool cargarDataset(const std::string& datasetPath)
 {
-    /*
-        Carga el CSV en host y, si hay GPU disponible, reconstruye el dataset
-        persistente completo en device antes de sustituir el estado anterior.
-    */
     DatasetColumns newDataset;
     LoadSummary newSummary;
     std::string errorMessage;
@@ -621,37 +541,29 @@ bool loadDatasetIntoState(AppState& appState, const std::string& datasetPath)
         return false;
     }
 
-    DeviceDataset newDevice;
-
-    if (appState.deviceReady && !buildDeviceDataset(newDataset, newDevice, errorMessage)) {
-        std::cout << "No se ha podido construir el dataset persistente en GPU.\n";
+    if (g_deviceReady && !subirDatasetAGPU(newDataset, errorMessage)) {
+        std::cout << "No se ha podido cargar el dataset en GPU.\n";
         std::cout << "Motivo: " << errorMessage << "\n";
         return false;
     }
 
-    releaseDeviceDataset(appState.device);
-    appState.datasetPath = datasetPath;
-    appState.dataset = std::move(newDataset);
-    appState.summary = newSummary;
-    appState.device = newDevice;
-    appState.datasetLoaded = true;
+    g_datasetPath = datasetPath;
+    g_dataset = std::move(newDataset);
+    g_summary = newSummary;
+    g_datasetLoaded = true;
 
-    printLoadSummary(appState);
-    printGpuSummary(appState);
+    printLoadSummary();
+    printGpuSummary();
     return true;
 }
 
-bool promptAndLoadDataset(AppState& appState, bool allowCancel)
+bool promptAndLoadDataset(bool allowCancel)
 {
-    /*
-        Pide la ruta del CSV, resuelve la ruta por defecto si existe y repite
-        el intento hasta cargar bien o cancelar, segun el contexto.
-    */
     while (true) {
         std::string defaultPath;
 
-        if (!appState.datasetPath.empty() && fileExists(appState.datasetPath)) {
-            defaultPath = appState.datasetPath;
+        if (!g_datasetPath.empty() && fileExists(g_datasetPath)) {
+            defaultPath = g_datasetPath;
         } else if (fileExists("src/data/Airline_dataset.csv")) {
             defaultPath = "src/data/Airline_dataset.csv";
         }
@@ -687,34 +599,27 @@ bool promptAndLoadDataset(AppState& appState, bool allowCancel)
             continue;
         }
 
-        if (loadDatasetIntoState(appState, selectedPath)) {
+        if (cargarDataset(selectedPath)) {
             return true;
         }
     }
 }
 
-bool canRunGpuPhase(const AppState& appState)
+bool datasetListoParaGPU()
 {
-    /*
-        Todas las fases GPU comparten la misma precondicion minima:
-
-        - dataset cargado en host;
-        - GPU CUDA accesible;
-        - dataset persistente creado en device.
-    */
-    if (!appState.datasetLoaded) {
+    if (!g_datasetLoaded) {
         std::cout << "No hay dataset cargado.\n";
         return false;
     }
 
-    if (!appState.deviceReady) {
+    if (!g_deviceReady) {
         std::cout << "No hay GPU CUDA disponible.\n";
-        std::cout << "Motivo: " << appState.deviceErrorMessage << "\n";
+        std::cout << "Motivo: " << g_deviceErrorMessage << "\n";
         return false;
     }
 
-    if (appState.device.rowCount <= 0) {
-        std::cout << "El dataset persistente en GPU no esta disponible.\n";
+    if (g_rowCount <= 0) {
+        std::cout << "El dataset en GPU no esta disponible.\n";
         return false;
     }
 
@@ -725,11 +630,7 @@ bool canRunGpuPhase(const AppState& appState)
     Fase 02: resumen CPU
 */
 
-void printPhase2HostSummary(
-    int threshold,
-    int resultCount,
-    const std::vector<int>& outDelayValues,
-    const std::vector<char>& outTailNumBuffer)
+void printPhase2HostSummary(int threshold, int resultCount, const std::vector<int>& outDelayValues, const std::vector<char>& outTailNumBuffer)
 {
     const char* label = threshold >= 0 ? "Retraso" : "Adelanto";
 
@@ -747,64 +648,48 @@ void printPhase2HostSummary(
 }
 
 /*
-    Fases CUDA
+    Fases 01 y 02
 */
 
-bool phase01(const AppState& appState, int threshold)
+bool phase01(int threshold)
 {
-    /*
-        Fase 01:
-
-        - usa DEP_DELAY ya residente en GPU;
-        - acepta un umbral firmado;
-        - solo lanza el kernel y espera su salida por consola.
-    */
-    const int totalElements = appState.device.rowCount;
-    const LaunchConfig launchConfig = computeLaunchConfig(totalElements, appState.deviceProp);
+    const LaunchConfig launchConfig = computeLaunchConfig(g_rowCount);
 
     std::cout << "DEP_DELAY | umbral " << threshold
               << " | " << launchConfig.blocks << " x " << launchConfig.threadsPerBlock << "\n";
 
     phase1DepartureDelayKernel<<<launchConfig.blocks, launchConfig.threadsPerBlock>>>(
-        appState.device.d_depDelay,
-        totalElements,
+        d_depDelay,
+        g_rowCount,
         threshold);
 
-    return finishKernel("phase1DepartureDelayKernel");
+    return ejecutarKernelYEsperar("phase1DepartureDelayKernel");
 }
 
-bool phase02(const AppState& appState, int threshold)
+bool phase02(int threshold)
 {
-    /*
-        Fase 02:
-
-        - usa ARR_DELAY y TAIL_NUM ya residentes en GPU;
-        - copia el umbral firmado a memoria constante;
-        - recupera al host solo el subconjunto detectado por el kernel.
-    */
-    const int totalElements = appState.device.rowCount;
-    const LaunchConfig launchConfig = computeLaunchConfig(totalElements, appState.deviceProp);
+    const LaunchConfig launchConfig = computeLaunchConfig(g_rowCount);
 
     std::cout << "ARR_DELAY + TAIL_NUM | umbral " << threshold
               << " | " << launchConfig.blocks << " x " << launchConfig.threadsPerBlock << "\n";
 
-    CUDA_RETURN_FALSE(cudaMemset(appState.device.d_phase2Count, 0, sizeof(int)));
+    CUDA_RETURN_FALSE(cudaMemset(d_phase2Count, 0, sizeof(int)));
     CUDA_RETURN_FALSE(copyPhase2ThresholdToConstant(threshold));
 
     phase2ArrivalDelayKernel<<<launchConfig.blocks, launchConfig.threadsPerBlock>>>(
-        appState.device.d_arrDelay,
-        appState.device.d_tailNums,
-        totalElements,
-        appState.device.d_phase2Count,
-        appState.device.d_phase2OutDelayValues,
-        appState.device.d_phase2OutTailNums);
+        d_arrDelay,
+        d_tailNums,
+        g_rowCount,
+        d_phase2Count,
+        d_phase2OutDelayValues,
+        d_phase2OutTailNums);
 
-    if (!finishKernel("phase2ArrivalDelayKernel")) {
+    if (!ejecutarKernelYEsperar("phase2ArrivalDelayKernel")) {
         return false;
     }
 
     int resultCount = 0;
-    CUDA_RETURN_FALSE(cudaMemcpy(&resultCount, appState.device.d_phase2Count, sizeof(int), cudaMemcpyDeviceToHost));
+    CUDA_RETURN_FALSE(cudaMemcpy(&resultCount, d_phase2Count, sizeof(int), cudaMemcpyDeviceToHost));
 
     std::vector<int> outDelayValues(static_cast<std::size_t>(resultCount));
     std::vector<char> outTailNumBuffer(static_cast<std::size_t>(resultCount) * kPhase2TailNumStride, '\0');
@@ -812,19 +697,37 @@ bool phase02(const AppState& appState, int threshold)
     if (resultCount > 0) {
         CUDA_RETURN_FALSE(cudaMemcpy(
             outDelayValues.data(),
-            appState.device.d_phase2OutDelayValues,
+            d_phase2OutDelayValues,
             static_cast<std::size_t>(resultCount) * sizeof(int),
             cudaMemcpyDeviceToHost));
 
         CUDA_RETURN_FALSE(cudaMemcpy(
             outTailNumBuffer.data(),
-            appState.device.d_phase2OutTailNums,
+            d_phase2OutTailNums,
             static_cast<std::size_t>(resultCount) * kPhase2TailNumStride * sizeof(char),
             cudaMemcpyDeviceToHost));
     }
 
     printPhase2HostSummary(threshold, resultCount, outDelayValues, outTailNumBuffer);
     return true;
+}
+
+/*
+    Helpers de reduccion para Fase 03
+*/
+
+int getReductionIdentity(bool isMax)
+{
+    return isMax ? INT_MIN : INT_MAX;
+}
+
+int hostCompareReduction(int left, int right, bool isMax)
+{
+    if (isMax) {
+        return left > right ? left : right;
+    }
+
+    return left < right ? left : right;
 }
 
 bool phase03AtomicVariant(
@@ -835,13 +738,9 @@ bool phase03AtomicVariant(
     const LaunchConfig& launchConfig,
     int& outResult)
 {
-    /*
-        Ejecuta una de las tres variantes atomicas de la Fase 03 sobre el
-        mismo vector de entrada ya compacto en GPU.
-    */
     int* deviceResult = nullptr;
-    const int initialValue = getReductionIdentity(isMax);
     std::size_t sharedBytes = 0;
+    const int initialValue = getReductionIdentity(isMax);
 
     if (!cudaOk(cudaMalloc(reinterpret_cast<void**>(&deviceResult), sizeof(int)), "cudaMalloc deviceResult")) {
         return false;
@@ -875,7 +774,7 @@ bool phase03AtomicVariant(
             isMax);
     }
 
-    if (!finishKernel("Fase 03 atomica")) {
+    if (!ejecutarKernelYEsperar("Fase 03 atomica")) {
         cudaFree(deviceResult);
         return false;
     }
@@ -889,24 +788,16 @@ bool phase03AtomicVariant(
     return true;
 }
 
-bool phase03ReductionVariant(int* deviceInput, int totalElements, bool isMax, const cudaDeviceProp& deviceProp, int& outResult)
+bool phase03ReductionVariant(int* deviceInput, int totalElements, bool isMax, int& outResult)
 {
-    /*
-        Variante 3.4:
-
-        - reduce por bloques en GPU;
-        - relanza sobre parciales;
-        - cierra en CPU solo cuando el vector final ya tiene 10 elementos o menos.
-    */
     int* currentInput = deviceInput;
     bool ownsCurrentInput = false;
     int currentCount = totalElements;
 
     while (currentCount > 10) {
-        const LaunchConfig launchConfig = computeLaunchConfig(currentCount, deviceProp);
+        const LaunchConfig launchConfig = computeLaunchConfig(currentCount);
         const std::size_t partialBytes = static_cast<std::size_t>(launchConfig.blocks) * sizeof(int);
         const std::size_t sharedBytes = static_cast<std::size_t>(launchConfig.threadsPerBlock) * sizeof(int);
-
         int* devicePartials = nullptr;
 
         if (!cudaOk(cudaMalloc(reinterpret_cast<void**>(&devicePartials), partialBytes), "cudaMalloc devicePartials")) {
@@ -922,11 +813,13 @@ bool phase03ReductionVariant(int* deviceInput, int totalElements, bool isMax, co
             currentCount,
             isMax);
 
-        if (!finishKernel("reductionPattern")) {
+        if (!ejecutarKernelYEsperar("reductionPattern")) {
             cudaFree(devicePartials);
+
             if (ownsCurrentInput) {
                 cudaFree(currentInput);
             }
+
             return false;
         }
 
@@ -951,6 +844,7 @@ bool phase03ReductionVariant(int* deviceInput, int totalElements, bool isMax, co
         if (ownsCurrentInput) {
             cudaFree(currentInput);
         }
+
         return false;
     }
 
@@ -967,24 +861,29 @@ bool phase03ReductionVariant(int* deviceInput, int totalElements, bool isMax, co
     return true;
 }
 
-bool phase03(const AppState& appState, Phase3ColumnOption columnOption, ReductionTypeOption reductionOption)
+bool phase03(int columnOption, int reductionOption)
 {
-    /*
-        Orquestador completo de la Fase 03:
+    const std::vector<float>* sourceColumn = &g_dataset.depDelay;
+    const char* columnLabel = "DEP_DELAY";
 
-        - selecciona columna;
-        - compacta ignorando NAN;
-        - copia el vector entero a GPU;
-        - ejecuta las cuatro variantes seguidas.
-    */
-    const std::vector<float>& sourceColumn = selectPhase3Column(appState.dataset, columnOption);
+    if (columnOption == 2) {
+        sourceColumn = &g_dataset.arrDelay;
+        columnLabel = "ARR_DELAY";
+    } else if (columnOption == 3) {
+        sourceColumn = &g_dataset.weatherDelay;
+        columnLabel = "WEATHER_DELAY";
+    }
+
+    const bool isMax = reductionOption == 1;
+    const char* reductionLabel = isMax ? "Maximo" : "Minimo";
+    const char* reductionFunctionLabel = isMax ? "Max" : "Min";
 
     std::vector<int> inputValues;
-    inputValues.reserve(sourceColumn.size());
+    inputValues.reserve(sourceColumn->size());
 
-    for (std::size_t i = 0; i < sourceColumn.size(); ++i) {
-        if (!std::isnan(sourceColumn[i])) {
-            inputValues.push_back(static_cast<int>(sourceColumn[i]));
+    for (std::size_t i = 0; i < sourceColumn->size(); ++i) {
+        if (!std::isnan((*sourceColumn)[i])) {
+            inputValues.push_back(static_cast<int>((*sourceColumn)[i]));
         }
     }
 
@@ -995,18 +894,7 @@ bool phase03(const AppState& appState, Phase3ColumnOption columnOption, Reductio
         return false;
     }
 
-    const bool isMax = reductionOption == ReductionTypeOption::Maximum;
-    const LaunchConfig launchConfig = computeLaunchConfig(totalElements, appState.deviceProp);
-
-    const char* columnLabel = "DEP_DELAY";
-    const char* reductionLabel = isMax ? "Maximo" : "Minimo";
-    const char* reductionFunctionLabel = isMax ? "Max" : "Min";
-
-    if (columnOption == Phase3ColumnOption::ArrivalDelay) {
-        columnLabel = "ARR_DELAY";
-    } else if (columnOption == Phase3ColumnOption::WeatherDelay) {
-        columnLabel = "WEATHER_DELAY";
-    }
+    const LaunchConfig launchConfig = computeLaunchConfig(totalElements);
 
     std::cout << columnLabel
               << " | " << reductionLabel
@@ -1015,9 +903,7 @@ bool phase03(const AppState& appState, Phase3ColumnOption columnOption, Reductio
 
     int* deviceInput = nullptr;
 
-    if (!cudaOk(
-            cudaMalloc(reinterpret_cast<void**>(&deviceInput), inputValues.size() * sizeof(int)),
-            "cudaMalloc deviceInput Fase 03")) {
+    if (!cudaOk(cudaMalloc(reinterpret_cast<void**>(&deviceInput), inputValues.size() * sizeof(int)), "cudaMalloc deviceInput Fase 03")) {
         return false;
     }
 
@@ -1035,14 +921,8 @@ bool phase03(const AppState& appState, Phase3ColumnOption columnOption, Reductio
 
     if (!phase03AtomicVariant(Phase3AtomicVariant::Simple, deviceInput, totalElements, isMax, launchConfig, simpleResult) ||
         !phase03AtomicVariant(Phase3AtomicVariant::Basic, deviceInput, totalElements, isMax, launchConfig, basicResult) ||
-        !phase03AtomicVariant(
-            Phase3AtomicVariant::Intermediate,
-            deviceInput,
-            totalElements,
-            isMax,
-            launchConfig,
-            intermediateResult) ||
-        !phase03ReductionVariant(deviceInput, totalElements, isMax, appState.deviceProp, reductionResult)) {
+        !phase03AtomicVariant(Phase3AtomicVariant::Intermediate, deviceInput, totalElements, isMax, launchConfig, intermediateResult) ||
+        !phase03ReductionVariant(deviceInput, totalElements, isMax, reductionResult)) {
         cudaFree(deviceInput);
         return false;
     }
@@ -1061,14 +941,17 @@ bool phase03(const AppState& appState, Phase3ColumnOption columnOption, Reductio
     return true;
 }
 
+/*
+    Fase 04
+*/
+
 void printPhase4Histogram(
-    HistogramAirportTypeOption airportType,
+    const char* airportLabel,
     int threshold,
     const std::vector<unsigned int>& histogram,
     const std::vector<int>& denseToSeqId,
     const std::unordered_map<int, std::string>& idToCode)
 {
-    const char* airportLabel = airportType == HistogramAirportTypeOption::Origin ? "origen" : "destino";
     const unsigned int minimumCount = static_cast<unsigned int>(threshold);
     unsigned int maximumShownCount = 0;
     int shownAirports = 0;
@@ -1122,22 +1005,14 @@ void printPhase4Histogram(
               << " (del total " << denseToSeqId.size() << ")\n";
 }
 
-bool phase04(const AppState& appState, HistogramAirportTypeOption airportType, int threshold)
+bool phase04(int airportOption, int threshold)
 {
-    /*
-        Fase 04:
-
-        - selecciona origen o destino dentro del dataset persistente;
-        - lanza histograma compartido y fusion global;
-        - devuelve el histograma a CPU para dibujarlo por consola.
-    */
-    const bool useOrigin = airportType == HistogramAirportTypeOption::Origin;
-    const int totalElements = useOrigin ? appState.device.originTotalElements : appState.device.destinationTotalElements;
-    const int totalBins = useOrigin ? appState.device.originTotalBins : appState.device.destinationTotalBins;
-    const int* denseInput = useOrigin ? appState.device.d_originDenseInput : appState.device.d_destinationDenseInput;
-    const std::vector<int>& denseToSeqId = useOrigin ? appState.device.originDenseToSeqId : appState.device.destinationDenseToSeqId;
-    const std::unordered_map<int, std::string>& idToCode =
-        useOrigin ? appState.dataset.originIdToCode : appState.dataset.destIdToCode;
+    const bool useOrigin = airportOption == 1;
+    const int totalElements = useOrigin ? g_originTotalElements : g_destinationTotalElements;
+    const int totalBins = useOrigin ? g_originTotalBins : g_destinationTotalBins;
+    const int* denseInput = useOrigin ? d_originDenseInput : d_destinationDenseInput;
+    const std::vector<int>& denseToSeqId = useOrigin ? g_originDenseToSeqId : g_destinationDenseToSeqId;
+    const std::unordered_map<int, std::string>& idToCode = useOrigin ? g_dataset.originIdToCode : g_dataset.destIdToCode;
     const char* airportLabel = useOrigin ? "origen" : "destino";
 
     if (totalElements <= 0 || totalBins <= 0 || denseInput == nullptr) {
@@ -1147,13 +1022,13 @@ bool phase04(const AppState& appState, HistogramAirportTypeOption airportType, i
 
     const std::size_t sharedBytes = static_cast<std::size_t>(totalBins) * sizeof(unsigned int);
 
-    if (sharedBytes > static_cast<std::size_t>(appState.deviceProp.sharedMemPerBlock)) {
+    if (sharedBytes > static_cast<std::size_t>(g_deviceProp.sharedMemPerBlock)) {
         std::cout << "El histograma no cabe en la memoria compartida por bloque de esta GPU.\n";
         return false;
     }
 
-    const LaunchConfig launchConfig = computeLaunchConfig(totalElements, appState.deviceProp);
-    const LaunchConfig mergeLaunchConfig = computeLaunchConfig(totalBins, appState.deviceProp);
+    const LaunchConfig launchConfig = computeLaunchConfig(totalElements);
+    const LaunchConfig mergeLaunchConfig = computeLaunchConfig(totalBins);
 
     std::cout << airportLabel
               << " | filas validas " << totalElements
@@ -1182,7 +1057,7 @@ bool phase04(const AppState& appState, HistogramAirportTypeOption airportType, i
         totalBins,
         devicePartialHistograms);
 
-    if (!finishKernel("phase4SharedHistogramKernel")) {
+    if (!ejecutarKernelYEsperar("phase4SharedHistogramKernel")) {
         cudaFree(devicePartialHistograms);
         cudaFree(deviceFinalHistogram);
         return false;
@@ -1194,7 +1069,7 @@ bool phase04(const AppState& appState, HistogramAirportTypeOption airportType, i
         totalBins,
         deviceFinalHistogram);
 
-    if (!finishKernel("phase4MergeHistogramKernel")) {
+    if (!ejecutarKernelYEsperar("phase4MergeHistogramKernel")) {
         cudaFree(devicePartialHistograms);
         cudaFree(deviceFinalHistogram);
         return false;
@@ -1211,7 +1086,7 @@ bool phase04(const AppState& appState, HistogramAirportTypeOption airportType, i
     cudaFree(devicePartialHistograms);
     cudaFree(deviceFinalHistogram);
 
-    printPhase4Histogram(airportType, threshold, histogram, denseToSeqId, idToCode);
+    printPhase4Histogram(airportLabel, threshold, histogram, denseToSeqId, idToCode);
     return true;
 }
 
@@ -1219,16 +1094,15 @@ bool phase04(const AppState& appState, HistogramAirportTypeOption airportType, i
 
 int main()
 {
-    AppState appState;
-
     std::cout << "========================================\n";
     std::cout << " PL1 CUDA - US Airline Dataset Toolkit\n";
     std::cout << "========================================\n";
 
-    appState.deviceReady = queryGpuInfo(appState.deviceProp, appState.deviceErrorMessage);
-    printGpuSummary(appState);
+    queryGpuInfo();
+    printGpuSummary();
 
-    if (!promptAndLoadDataset(appState, true)) {
+    if (!promptAndLoadDataset(true)) {
+        liberarGPU();
         std::cout << "Saliendo sin cargar dataset.\n";
         return 0;
     }
@@ -1238,7 +1112,7 @@ int main()
     bool keepRunning = true;
 
     while (keepRunning) {
-        MainMenuOption selectedOption = MainMenuOption::Exit;
+        std::string optionInput;
 
         while (true) {
             std::cout << "\nMenu principal\n";
@@ -1251,52 +1125,25 @@ int main()
             std::cout << "X. Salir\n";
             std::cout << "> ";
 
-            std::string optionInput;
             std::getline(std::cin, optionInput);
             optionInput = trimWhitespace(optionInput);
 
-            if (optionInput == "1") {
-                selectedOption = MainMenuOption::Phase1;
-                break;
-            }
-
-            if (optionInput == "2") {
-                selectedOption = MainMenuOption::Phase2;
-                break;
-            }
-
-            if (optionInput == "3") {
-                selectedOption = MainMenuOption::Phase3;
-                break;
-            }
-
-            if (optionInput == "4") {
-                selectedOption = MainMenuOption::Phase4;
-                break;
-            }
-
-            if (optionInput == "R" || optionInput == "r") {
-                selectedOption = MainMenuOption::ReloadCsv;
-                break;
-            }
-
-            if (optionInput == "I" || optionInput == "i") {
-                selectedOption = MainMenuOption::ShowStatus;
-                break;
-            }
-
-            if (isCancelToken(optionInput)) {
-                selectedOption = MainMenuOption::Exit;
+            if (optionInput == "1" ||
+                optionInput == "2" ||
+                optionInput == "3" ||
+                optionInput == "4" ||
+                optionInput == "R" || optionInput == "r" ||
+                optionInput == "I" || optionInput == "i" ||
+                isCancelToken(optionInput)) {
                 break;
             }
 
             std::cout << "Opcion no valida.\n";
         }
 
-        switch (selectedOption) {
-        case MainMenuOption::Phase1: {
-            if (!canRunGpuPhase(appState)) {
-                break;
+        if (optionInput == "1") {
+            if (!datasetListoParaGPU()) {
+                continue;
             }
 
             std::cout << "\nFase 01 - DEP_DELAY\n";
@@ -1306,20 +1153,20 @@ int main()
             if (!readSignedThreshold(
                     "Umbral firmado (positivo=retraso, negativo=adelanto, X para volver): ",
                     threshold)) {
-                break;
+                continue;
             }
 
-            if (!phase01(appState, threshold)) {
+            if (!phase01(threshold)) {
                 std::cout << "La Fase 01 no se ha podido completar.\n";
             }
 
             pauseForEnter();
-            break;
+            continue;
         }
 
-        case MainMenuOption::Phase2: {
-            if (!canRunGpuPhase(appState)) {
-                break;
+        if (optionInput == "2") {
+            if (!datasetListoParaGPU()) {
+                continue;
             }
 
             std::cout << "\nFase 02 - ARR_DELAY + TAIL_NUM\n";
@@ -1329,20 +1176,20 @@ int main()
             if (!readSignedThreshold(
                     "Umbral firmado (positivo=retraso, negativo=adelanto, X para volver): ",
                     threshold)) {
-                break;
+                continue;
             }
 
-            if (!phase02(appState, threshold)) {
+            if (!phase02(threshold)) {
                 std::cout << "La Fase 02 no se ha podido completar.\n";
             }
 
             pauseForEnter();
-            break;
+            continue;
         }
 
-        case MainMenuOption::Phase3: {
-            if (!canRunGpuPhase(appState)) {
-                break;
+        if (optionInput == "3") {
+            if (!datasetListoParaGPU()) {
+                continue;
             }
 
             std::cout << "\nFase 03 - Reduccion\n";
@@ -1352,29 +1199,26 @@ int main()
             int reductionValue = 0;
 
             if (!readIntegerInRange("Columna: ", "Debe introducir un numero entre 1 y 3, o X.", 1, 3, columnValue)) {
-                break;
+                continue;
             }
 
             std::cout << "1. Maximo  2. Minimo\n";
 
             if (!readIntegerInRange("Reduccion: ", "Debe introducir un numero entre 1 y 2, o X.", 1, 2, reductionValue)) {
-                break;
+                continue;
             }
 
-            if (!phase03(
-                    appState,
-                    static_cast<Phase3ColumnOption>(columnValue),
-                    static_cast<ReductionTypeOption>(reductionValue))) {
+            if (!phase03(columnValue, reductionValue)) {
                 std::cout << "La Fase 03 no se ha podido completar.\n";
             }
 
             pauseForEnter();
-            break;
+            continue;
         }
 
-        case MainMenuOption::Phase4: {
-            if (!canRunGpuPhase(appState)) {
-                break;
+        if (optionInput == "4") {
+            if (!datasetListoParaGPU()) {
+                continue;
             }
 
             std::cout << "\nFase 04 - Histograma de aeropuertos\n";
@@ -1384,43 +1228,42 @@ int main()
             int threshold = 0;
 
             if (!readIntegerInRange("Tipo de aeropuerto: ", "Debe introducir un numero entre 1 y 2, o X.", 1, 2, airportValue)) {
-                break;
+                continue;
             }
 
             if (!readIntegerInRange("Umbral minimo (>= 0, X para volver): ", "Debe introducir un numero mayor o igual que 0, o X.", 0, INT_MAX, threshold)) {
-                break;
+                continue;
             }
 
-            if (!phase04(appState, static_cast<HistogramAirportTypeOption>(airportValue), threshold)) {
+            if (!phase04(airportValue, threshold)) {
                 std::cout << "La Fase 04 no se ha podido completar.\n";
             }
 
             pauseForEnter();
-            break;
+            continue;
         }
 
-        case MainMenuOption::ReloadCsv:
-            promptAndLoadDataset(appState, true);
-            break;
+        if (optionInput == "R" || optionInput == "r") {
+            promptAndLoadDataset(true);
+            continue;
+        }
 
-        case MainMenuOption::ShowStatus:
-            if (appState.datasetLoaded) {
-                printLoadSummary(appState);
+        if (optionInput == "I" || optionInput == "i") {
+            if (g_datasetLoaded) {
+                printLoadSummary();
             } else {
                 std::cout << "\nDataset no cargado.\n";
             }
 
-            printGpuSummary(appState);
+            printGpuSummary();
             pauseForEnter();
-            break;
-
-        case MainMenuOption::Exit:
-            keepRunning = false;
-            break;
+            continue;
         }
+
+        keepRunning = false;
     }
 
-    releaseDeviceDataset(appState.device);
+    liberarGPU();
     std::cout << "\nAplicacion finalizada.\n";
     return 0;
 }
