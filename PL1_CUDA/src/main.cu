@@ -224,9 +224,7 @@ int main()
                 continue;
             }
 
-            if (!phase01(threshold)) {
-                std::cout << "La Fase 01 no se ha podido completar.\n";
-            }
+            phase01(threshold);
 
             pauseForEnter();
             continue;
@@ -247,9 +245,7 @@ int main()
                 continue;
             }
 
-            if (!phase02(threshold)) {
-                std::cout << "La Fase 02 no se ha podido completar.\n";
-            }
+            phase02(threshold);
 
             pauseForEnter();
             continue;
@@ -276,9 +272,7 @@ int main()
                 continue;
             }
 
-            if (!phase03(columnValue, reductionValue)) {
-                std::cout << "La Fase 03 no se ha podido completar.\n";
-            }
+            phase03(columnValue, reductionValue);
 
             pauseForEnter();
             continue;
@@ -303,9 +297,7 @@ int main()
                 continue;
             }
 
-            if (!phase04(airportValue, threshold)) {
-                std::cout << "La Fase 04 no se ha podido completar.\n";
-            }
+            phase04(airportValue, threshold);
 
             pauseForEnter();
             continue;

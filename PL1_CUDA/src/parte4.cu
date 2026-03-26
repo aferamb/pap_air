@@ -126,7 +126,7 @@ void printPhase4Histogram(
 
 } // namespace
 
-bool phase04(int airportOption, int threshold)
+void phase04(int airportOption, int threshold)
 {
     const bool useOrigin = airportOption == 1;
     const int totalElements = useOrigin ? g_originTotalElements : g_destinationTotalElements;
@@ -138,14 +138,14 @@ bool phase04(int airportOption, int threshold)
 
     if (totalElements <= 0 || totalBins <= 0 || denseInput == nullptr) {
         std::cout << "No hay datos validos para la Fase 04.\n";
-        return false;
+        return;
     }
 
     const std::size_t sharedBytes = static_cast<std::size_t>(totalBins) * sizeof(unsigned int);
 
     if (sharedBytes > static_cast<std::size_t>(g_deviceProp.sharedMemPerBlock)) {
         std::cout << "El histograma no cabe en la memoria compartida por bloque de esta GPU.\n";
-        return false;
+        return;
     }
 
     const LaunchConfig launchConfig = computeLaunchConfig(totalElements);
@@ -163,14 +163,8 @@ bool phase04(int airportOption, int threshold)
         static_cast<std::size_t>(launchConfig.blocks) * static_cast<std::size_t>(totalBins) * sizeof(unsigned int);
     const std::size_t finalBytes = static_cast<std::size_t>(totalBins) * sizeof(unsigned int);
 
-    if (!cudaOk(cudaMalloc(reinterpret_cast<void**>(&devicePartialHistograms), partialBytes), "cudaMalloc devicePartialHistograms")) {
-        return false;
-    }
-
-    if (!cudaOk(cudaMalloc(reinterpret_cast<void**>(&deviceFinalHistogram), finalBytes), "cudaMalloc deviceFinalHistogram")) {
-        cudaFree(devicePartialHistograms);
-        return false;
-    }
+    cudaMalloc(reinterpret_cast<void**>(&devicePartialHistograms), partialBytes);
+    cudaMalloc(reinterpret_cast<void**>(&deviceFinalHistogram), finalBytes);
 
     phase4SharedHistogramKernel<<<launchConfig.blocks, launchConfig.threadsPerBlock, sharedBytes>>>(
         denseInput,
@@ -178,10 +172,11 @@ bool phase04(int airportOption, int threshold)
         totalBins,
         devicePartialHistograms);
 
-    if (!ejecutarKernelYEsperar("phase4SharedHistogramKernel")) {
+    if (!executeAndWait("phase4SharedHistogramKernel")) {
         cudaFree(devicePartialHistograms);
         cudaFree(deviceFinalHistogram);
-        return false;
+        std::cout << "La Fase 04 no se ha podido completar.\n";
+        return;
     }
 
     phase4MergeHistogramKernel<<<mergeLaunchConfig.blocks, mergeLaunchConfig.threadsPerBlock>>>(
@@ -190,23 +185,19 @@ bool phase04(int airportOption, int threshold)
         totalBins,
         deviceFinalHistogram);
 
-    if (!ejecutarKernelYEsperar("phase4MergeHistogramKernel")) {
+    if (!executeAndWait("phase4MergeHistogramKernel")) {
         cudaFree(devicePartialHistograms);
         cudaFree(deviceFinalHistogram);
-        return false;
+        std::cout << "La Fase 04 no se ha podido completar.\n";
+        return;
     }
 
     std::vector<unsigned int> histogram(static_cast<std::size_t>(totalBins), 0U);
 
-    if (!cudaOk(cudaMemcpy(histogram.data(), deviceFinalHistogram, finalBytes, cudaMemcpyDeviceToHost), "cudaMemcpy deviceFinalHistogram")) {
-        cudaFree(devicePartialHistograms);
-        cudaFree(deviceFinalHistogram);
-        return false;
-    }
+    cudaMemcpy(histogram.data(), deviceFinalHistogram, finalBytes, cudaMemcpyDeviceToHost);
 
     cudaFree(devicePartialHistograms);
     cudaFree(deviceFinalHistogram);
 
     printPhase4Histogram(airportLabel, threshold, histogram, denseToSeqId, idToCode);
-    return true;
 }

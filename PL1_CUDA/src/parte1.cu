@@ -49,7 +49,7 @@ __global__ void phase1DepartureDelayKernel(const float* delayValues, int totalEl
 
 } // namespace
 
-bool phase01(int threshold)
+void phase01(int threshold)
 {
     const LaunchConfig launchConfig = computeLaunchConfig(g_rowCount);
 
@@ -61,5 +61,7 @@ bool phase01(int threshold)
         g_rowCount,
         threshold);
 
-    return ejecutarKernelYEsperar("phase1DepartureDelayKernel");
+    if (!executeAndWait("phase1DepartureDelayKernel")) {
+        std::cout << "La Fase 01 no se ha podido completar.\n";
+    }
 }

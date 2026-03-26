@@ -103,71 +103,43 @@ bool subirDatasetAGPU(const DatasetColumns& dataset, std::string& errorMessage)
     const std::size_t outDelayBytes = static_cast<std::size_t>(rowCount) * sizeof(int);
     const std::size_t outTailBytes = static_cast<std::size_t>(rowCount) * kPhase2TailNumStride * sizeof(char);
 
-    if (!cudaOk(cudaMalloc(reinterpret_cast<void**>(&d_depDelay), delayBytes), "cudaMalloc d_depDelay") ||
-        !cudaOk(cudaMalloc(reinterpret_cast<void**>(&d_arrDelay), delayBytes), "cudaMalloc d_arrDelay") ||
-        !cudaOk(cudaMalloc(reinterpret_cast<void**>(&d_tailNums), tailBytes), "cudaMalloc d_tailNums") ||
-        !cudaOk(cudaMalloc(reinterpret_cast<void**>(&d_phase2Count), sizeof(int)), "cudaMalloc d_phase2Count") ||
-        !cudaOk(cudaMalloc(reinterpret_cast<void**>(&d_phase2OutDelayValues), outDelayBytes), "cudaMalloc d_phase2OutDelayValues") ||
-        !cudaOk(cudaMalloc(reinterpret_cast<void**>(&d_phase2OutTailNums), outTailBytes), "cudaMalloc d_phase2OutTailNums")) {
-        liberarGPU();
-        errorMessage = "No se ha podido reservar la memoria principal de GPU.";
-        return false;
+    cudaMalloc(reinterpret_cast<void**>(&d_depDelay), delayBytes);
+    cudaMalloc(reinterpret_cast<void**>(&d_arrDelay), delayBytes);
+    cudaMalloc(reinterpret_cast<void**>(&d_tailNums), tailBytes);
+    cudaMalloc(reinterpret_cast<void**>(&d_phase2Count), sizeof(int));
+    cudaMalloc(reinterpret_cast<void**>(&d_phase2OutDelayValues), outDelayBytes);
+    cudaMalloc(reinterpret_cast<void**>(&d_phase2OutTailNums), outTailBytes);
+
+    if (!originDenseInput.empty()) {
+        cudaMalloc(
+            reinterpret_cast<void**>(&d_originDenseInput),
+            static_cast<std::size_t>(originDenseInput.size()) * sizeof(int));
     }
 
-    if (!originDenseInput.empty() &&
-        !cudaOk(
-            cudaMalloc(
-                reinterpret_cast<void**>(&d_originDenseInput),
-                static_cast<std::size_t>(originDenseInput.size()) * sizeof(int)),
-            "cudaMalloc d_originDenseInput")) {
-        liberarGPU();
-        errorMessage = "No se ha podido reservar d_originDenseInput.";
-        return false;
+    if (!destinationDenseInput.empty()) {
+        cudaMalloc(
+            reinterpret_cast<void**>(&d_destinationDenseInput),
+            static_cast<std::size_t>(destinationDenseInput.size()) * sizeof(int));
     }
 
-    if (!destinationDenseInput.empty() &&
-        !cudaOk(
-            cudaMalloc(
-                reinterpret_cast<void**>(&d_destinationDenseInput),
-                static_cast<std::size_t>(destinationDenseInput.size()) * sizeof(int)),
-            "cudaMalloc d_destinationDenseInput")) {
-        liberarGPU();
-        errorMessage = "No se ha podido reservar d_destinationDenseInput.";
-        return false;
+    cudaMemcpy(d_depDelay, dataset.depDelay.data(), delayBytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_arrDelay, dataset.arrDelay.data(), delayBytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_tailNums, tailBuffer.data(), tailBytes, cudaMemcpyHostToDevice);
+
+    if (!originDenseInput.empty()) {
+        cudaMemcpy(
+            d_originDenseInput,
+            originDenseInput.data(),
+            static_cast<std::size_t>(originDenseInput.size()) * sizeof(int),
+            cudaMemcpyHostToDevice);
     }
 
-    if (!cudaOk(cudaMemcpy(d_depDelay, dataset.depDelay.data(), delayBytes, cudaMemcpyHostToDevice), "cudaMemcpy H2D d_depDelay") ||
-        !cudaOk(cudaMemcpy(d_arrDelay, dataset.arrDelay.data(), delayBytes, cudaMemcpyHostToDevice), "cudaMemcpy H2D d_arrDelay") ||
-        !cudaOk(cudaMemcpy(d_tailNums, tailBuffer.data(), tailBytes, cudaMemcpyHostToDevice), "cudaMemcpy H2D d_tailNums")) {
-        liberarGPU();
-        errorMessage = "No se han podido copiar las columnas base a GPU.";
-        return false;
-    }
-
-    if (!originDenseInput.empty() &&
-        !cudaOk(
-            cudaMemcpy(
-                d_originDenseInput,
-                originDenseInput.data(),
-                static_cast<std::size_t>(originDenseInput.size()) * sizeof(int),
-                cudaMemcpyHostToDevice),
-            "cudaMemcpy H2D d_originDenseInput")) {
-        liberarGPU();
-        errorMessage = "No se ha podido copiar d_originDenseInput.";
-        return false;
-    }
-
-    if (!destinationDenseInput.empty() &&
-        !cudaOk(
-            cudaMemcpy(
-                d_destinationDenseInput,
-                destinationDenseInput.data(),
-                static_cast<std::size_t>(destinationDenseInput.size()) * sizeof(int),
-                cudaMemcpyHostToDevice),
-            "cudaMemcpy H2D d_destinationDenseInput")) {
-        liberarGPU();
-        errorMessage = "No se ha podido copiar d_destinationDenseInput.";
-        return false;
+    if (!destinationDenseInput.empty()) {
+        cudaMemcpy(
+            d_destinationDenseInput,
+            destinationDenseInput.data(),
+            static_cast<std::size_t>(destinationDenseInput.size()) * sizeof(int),
+            cudaMemcpyHostToDevice);
     }
 
     g_rowCount = rowCount;

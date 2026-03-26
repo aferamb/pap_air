@@ -6,4 +6,4 @@
     API publica de la Fase 04.
 */
 
-bool phase04(int airportOption, int threshold);
+void phase04(int airportOption, int threshold);

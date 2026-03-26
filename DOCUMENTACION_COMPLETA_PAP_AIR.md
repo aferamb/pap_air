@@ -572,7 +572,7 @@ Lee un entero firmado para Fases 01 y 02. La semantica es:
 No existe ya un modo separado "retraso/adelanto/ambos". La decision se toma
 solo con el signo del umbral.
 
-## 5.4. `cudaOk` y `ejecutarKernelYEsperar`
+## 5.4. `cudaOk` y `executeAndWait`
 
 Estas dos funciones concentran la gestion de error CUDA del host.
 
@@ -582,7 +582,7 @@ Estas dos funciones concentran la gestion de error CUDA del host.
 - si es `cudaSuccess`, devuelve `true`
 - si no, imprime el contexto y devuelve `false`
 
-### `ejecutarKernelYEsperar`
+### `executeAndWait`
 
 Hace el patron tipico despues de un kernel:
 
@@ -901,7 +901,7 @@ Flujo:
 1. calcula `LaunchConfig`
 2. imprime la configuracion visible
 3. lanza `phase1DepartureDelayKernel`
-4. llama a `ejecutarKernelYEsperar`
+4. llama a `executeAndWait`
 
 ### Diagrama
 

@@ -37,24 +37,25 @@ int g_destinationTotalElements = 0;
 int g_destinationTotalBins = 0;
 std::vector<int> g_destinationDenseToSeqId;
 
-bool cudaOk(cudaError_t status, const char* context)
+bool executeAndWait(const char* context)
 {
-    if (status == cudaSuccess) {
-        return true;
-    }
+    const cudaError_t launchStatus = cudaGetLastError();
 
-    std::cout << "Error CUDA en " << context << ": "
-              << cudaGetErrorString(status) << "\n";
-    return false;
-}
-
-bool ejecutarKernelYEsperar(const char* context)
-{
-    if (!cudaOk(cudaGetLastError(), context)) {
+    if (launchStatus != cudaSuccess) {
+        std::cout << "Error CUDA en " << context << ": "
+                  << cudaGetErrorString(launchStatus) << "\n";
         return false;
     }
 
-    return cudaOk(cudaDeviceSynchronize(), context);
+    const cudaError_t syncStatus = cudaDeviceSynchronize();
+
+    if (syncStatus != cudaSuccess) {
+        std::cout << "Error CUDA en " << context << ": "
+                  << cudaGetErrorString(syncStatus) << "\n";
+        return false;
+    }
+
+    return true;
 }
 
 bool queryGpuInfo()

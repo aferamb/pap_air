@@ -198,13 +198,8 @@ bool phase03AtomicVariant(
     int* deviceResult = nullptr;
     std::size_t sharedBytes = 0;
     const int initialValue = getReductionIdentity(isMax);
-    if (!cudaOk(cudaMalloc(reinterpret_cast<void**>(&deviceResult), sizeof(int)), "cudaMalloc deviceResult")) {
-        return false;
-    }
-    if (!cudaOk(cudaMemcpy(deviceResult, &initialValue, sizeof(int), cudaMemcpyHostToDevice), "cudaMemcpy deviceResult")) {
-        cudaFree(deviceResult);
-        return false;
-    }
+    cudaMalloc(reinterpret_cast<void**>(&deviceResult), sizeof(int));
+    cudaMemcpy(deviceResult, &initialValue, sizeof(int), cudaMemcpyHostToDevice);
 
     if (variant == Phase3AtomicVariant::Simple) {
         reductionSimple<<<launchConfig.blocks, launchConfig.threadsPerBlock>>>(
@@ -228,14 +223,11 @@ bool phase03AtomicVariant(
             totalElements,
             isMax);
     }
-    if (!ejecutarKernelYEsperar("Fase 03 atomica")) {
+    if (!executeAndWait("Fase 03 atomica")) {
         cudaFree(deviceResult);
         return false;
     }
-    if (!cudaOk(cudaMemcpy(&outResult, deviceResult, sizeof(int), cudaMemcpyDeviceToHost), "cudaMemcpy deviceResult")) {
-        cudaFree(deviceResult);
-        return false;
-    }
+    cudaMemcpy(&outResult, deviceResult, sizeof(int), cudaMemcpyDeviceToHost);
     cudaFree(deviceResult);
     return true;
 }
@@ -250,18 +242,13 @@ bool phase03ReductionVariant(int* deviceInput, int totalElements, bool isMax, in
         const std::size_t partialBytes = static_cast<std::size_t>(launchConfig.blocks) * sizeof(int);
         const std::size_t sharedBytes = static_cast<std::size_t>(launchConfig.threadsPerBlock) * sizeof(int);
         int* devicePartials = nullptr;
-        if (!cudaOk(cudaMalloc(reinterpret_cast<void**>(&devicePartials), partialBytes), "cudaMalloc devicePartials")) {
-            if (ownsCurrentInput) {
-                cudaFree(currentInput);
-            }
-            return false;
-        }
+        cudaMalloc(reinterpret_cast<void**>(&devicePartials), partialBytes);
         reductionPattern<<<launchConfig.blocks, launchConfig.threadsPerBlock, sharedBytes>>>(
             currentInput,
             devicePartials,
             currentCount,
             isMax);
-        if (!ejecutarKernelYEsperar("reductionPattern")) {
+        if (!executeAndWait("reductionPattern")) {
             cudaFree(devicePartials);
             if (ownsCurrentInput) {
                 cudaFree(currentInput);
@@ -276,18 +263,11 @@ bool phase03ReductionVariant(int* deviceInput, int totalElements, bool isMax, in
         currentCount = launchConfig.blocks;
     }
     std::vector<int> hostFinalValues(static_cast<std::size_t>(currentCount));
-    if (!cudaOk(
-            cudaMemcpy(
-                hostFinalValues.data(),
-                currentInput,
-                static_cast<std::size_t>(currentCount) * sizeof(int),
-                cudaMemcpyDeviceToHost),
-            "cudaMemcpy vector final Fase 03")) {
-        if (ownsCurrentInput) {
-            cudaFree(currentInput);
-        }
-        return false;
-    }
+    cudaMemcpy(
+        hostFinalValues.data(),
+        currentInput,
+        static_cast<std::size_t>(currentCount) * sizeof(int),
+        cudaMemcpyDeviceToHost);
     outResult = hostFinalValues[0];
     for (int i = 1; i < currentCount; ++i) {
         outResult = hostCompareReduction(outResult, hostFinalValues[static_cast<std::size_t>(i)], isMax);
@@ -300,7 +280,7 @@ bool phase03ReductionVariant(int* deviceInput, int totalElements, bool isMax, in
 
 } // namespace
 
-bool phase03(int columnOption, int reductionOption)
+void phase03(int columnOption, int reductionOption)
 {
     const std::vector<float>* sourceColumn = &g_dataset.depDelay;
     const char* columnLabel = "DEP_DELAY";
@@ -324,7 +304,7 @@ bool phase03(int columnOption, int reductionOption)
     const int totalElements = static_cast<int>(inputValues.size());
     if (totalElements <= 0) {
         std::cout << "No hay valores validos para la Fase 03.\n";
-        return false;
+        return;
     }
     const LaunchConfig launchConfig = computeLaunchConfig(totalElements);
     std::cout << columnLabel
@@ -332,15 +312,8 @@ bool phase03(int columnOption, int reductionOption)
               << " | validos " << totalElements
               << " | " << launchConfig.blocks << " x " << launchConfig.threadsPerBlock << "\n";
     int* deviceInput = nullptr;
-    if (!cudaOk(cudaMalloc(reinterpret_cast<void**>(&deviceInput), inputValues.size() * sizeof(int)), "cudaMalloc deviceInput Fase 03")) {
-        return false;
-    }
-    if (!cudaOk(
-            cudaMemcpy(deviceInput, inputValues.data(), inputValues.size() * sizeof(int), cudaMemcpyHostToDevice),
-            "cudaMemcpy deviceInput Fase 03")) {
-        cudaFree(deviceInput);
-        return false;
-    }
+    cudaMalloc(reinterpret_cast<void**>(&deviceInput), inputValues.size() * sizeof(int));
+    cudaMemcpy(deviceInput, inputValues.data(), inputValues.size() * sizeof(int), cudaMemcpyHostToDevice);
     int simpleResult = 0;
     int basicResult = 0;
     int intermediateResult = 0;
@@ -350,7 +323,8 @@ bool phase03(int columnOption, int reductionOption)
         !phase03AtomicVariant(Phase3AtomicVariant::Intermediate, deviceInput, totalElements, isMax, launchConfig, intermediateResult) ||
         !phase03ReductionVariant(deviceInput, totalElements, isMax, reductionResult)) {
         cudaFree(deviceInput);
-        return false;
+        std::cout << "La Fase 03 no se ha podido completar.\n";
+        return;
     }
     cudaFree(deviceInput);
     std::cout << "\n[Simple] " << reductionFunctionLabel << "() " << columnLabel
@@ -361,6 +335,4 @@ bool phase03(int columnOption, int reductionOption)
               << " = " << intermediateResult << " minutos\n";
     std::cout << "[Reduccion] " << reductionFunctionLabel << "() " << columnLabel
               << " = " << reductionResult << " minutos\n";
-
-    return true;
 }

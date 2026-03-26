@@ -6,4 +6,4 @@
     API publica de la Fase 01.
 */
 
-bool phase01(int threshold);
+void phase01(int threshold);

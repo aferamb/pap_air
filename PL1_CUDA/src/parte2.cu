@@ -21,9 +21,9 @@ __device__ bool matchesSignedThreshold(int value, int threshold)
     return value <= threshold;
 }
 
-cudaError_t copyPhase2ThresholdToConstant(int threshold)
+void copyPhase2ThresholdToConstant(int threshold)
 {
-    return cudaMemcpyToSymbol(d_phase2Threshold, &threshold, sizeof(int));
+    cudaMemcpyToSymbol(d_phase2Threshold, &threshold, sizeof(int));
 }
 
 /*
@@ -99,15 +99,15 @@ void printPhase2HostSummary(
 
 } // namespace
 
-bool phase02(int threshold)
+void phase02(int threshold)
 {
     const LaunchConfig launchConfig = computeLaunchConfig(g_rowCount);
 
     std::cout << "ARR_DELAY + TAIL_NUM | umbral " << threshold
               << " | " << launchConfig.blocks << " x " << launchConfig.threadsPerBlock << "\n";
 
-    CUDA_RETURN_FALSE(cudaMemset(d_phase2Count, 0, sizeof(int)));
-    CUDA_RETURN_FALSE(copyPhase2ThresholdToConstant(threshold));
+    cudaMemset(d_phase2Count, 0, sizeof(int));
+    copyPhase2ThresholdToConstant(threshold);
 
     phase2ArrivalDelayKernel<<<launchConfig.blocks, launchConfig.threadsPerBlock>>>(
         d_arrDelay,
@@ -117,30 +117,30 @@ bool phase02(int threshold)
         d_phase2OutDelayValues,
         d_phase2OutTailNums);
 
-    if (!ejecutarKernelYEsperar("phase2ArrivalDelayKernel")) {
-        return false;
+    if (!executeAndWait("phase2ArrivalDelayKernel")) {
+        std::cout << "La Fase 02 no se ha podido completar.\n";
+        return;
     }
 
     int resultCount = 0;
-    CUDA_RETURN_FALSE(cudaMemcpy(&resultCount, d_phase2Count, sizeof(int), cudaMemcpyDeviceToHost));
+    cudaMemcpy(&resultCount, d_phase2Count, sizeof(int), cudaMemcpyDeviceToHost);
 
     std::vector<int> outDelayValues(static_cast<std::size_t>(resultCount));
     std::vector<char> outTailNumBuffer(static_cast<std::size_t>(resultCount) * kPhase2TailNumStride, '\0');
 
     if (resultCount > 0) {
-        CUDA_RETURN_FALSE(cudaMemcpy(
+        cudaMemcpy(
             outDelayValues.data(),
             d_phase2OutDelayValues,
             static_cast<std::size_t>(resultCount) * sizeof(int),
-            cudaMemcpyDeviceToHost));
+            cudaMemcpyDeviceToHost);
 
-        CUDA_RETURN_FALSE(cudaMemcpy(
+        cudaMemcpy(
             outTailNumBuffer.data(),
             d_phase2OutTailNums,
             static_cast<std::size_t>(resultCount) * kPhase2TailNumStride * sizeof(char),
-            cudaMemcpyDeviceToHost));
+            cudaMemcpyDeviceToHost);
     }
 
     printPhase2HostSummary(threshold, resultCount, outDelayValues, outTailNumBuffer);
-    return true;
 }

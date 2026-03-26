@@ -301,7 +301,7 @@ La funcion host es `phase01(int threshold)` en [`main.cu`](/mnt/c/Users/05jan/De
 1. calcular la configuracion de lanzamiento con `computeLaunchConfig(...)`;
 2. mostrar por consola la configuracion usada;
 3. lanzar `phase1DepartureDelayKernel(...)`;
-4. sincronizar y comprobar errores con `ejecutarKernelYEsperar(...)`.
+4. sincronizar y comprobar errores con `executeAndWait(...)`.
 
 ### 7.2. Kernel device
 
@@ -670,7 +670,7 @@ Aunque la memoria no pretende describir cada linea, si conviene dejar claro el p
 - `queryGpuInfo()`: detecta la GPU y sus propiedades.
 - `computeLaunchConfig(...)`: calcula bloques e hilos por bloque.
 - `cudaOk(...)`: compacta la comprobacion de errores CUDA.
-- `ejecutarKernelYEsperar(...)`: verifica lanzamiento y sincroniza.
+- `executeAndWait(...)`: verifica lanzamiento y sincroniza.
 
 ### 12.3. Fases
 

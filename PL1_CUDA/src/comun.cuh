@@ -16,11 +16,6 @@
     evitar pasar structs grandes entre modulos.
 */
 
-#define CUDA_RETURN_FALSE(call) \
-    do { \
-        if (!cudaOk((call), #call)) return false; \
-    } while (0)
-
 // Tamano fijo de la matricula linealizada para la Fase 02.
 constexpr int kPhase2TailNumStride = 16;
 
@@ -64,8 +59,7 @@ extern int g_destinationTotalElements;
 extern int g_destinationTotalBins;
 extern std::vector<int> g_destinationDenseToSeqId;
 
-bool cudaOk(cudaError_t status, const char* context);
-bool ejecutarKernelYEsperar(const char* context);
+bool executeAndWait(const char* context);
 bool queryGpuInfo();
 LaunchConfig computeLaunchConfig(int totalElements);
 void printGpuSummary();
