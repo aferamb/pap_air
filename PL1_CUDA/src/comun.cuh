@@ -45,7 +45,7 @@ extern int g_rowCount;                              // Número total de filas de
 extern float* d_depDelay;                           // Puntero a la columna de retrasos de salida en la GPU
 extern float* d_arrDelay;                           // Puntero a la columna de retrasos de llegada en la GPU
 extern char* d_tailNums;                            // Puntero a la columna de tailNums en la GPU, se mantiene como char* para facilitar el manejo de strings de longitud variable
-// TODO:extra, es necesario?
+
 extern int* d_originSeqId;                          // Puntero a la columna de originSeqId en la GPU
 extern int* d_destSeqId;                            // Puntero a la columna de destSeqId en la GPU
 extern int* d_originAirportCodes;                   // Puntero a la columna de códigos de aeropuerto de origen en la GPU, se mantiene como int* para facilitar el manejo de códigos de aeropuerto mapeados a enteros

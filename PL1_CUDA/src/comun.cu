@@ -22,7 +22,6 @@ int g_rowCount = 0;                             // Número total de filas del da
 float* d_depDelay = nullptr;                    // Puntero a la columna de retrasos de salida en la GPU
 float* d_arrDelay = nullptr;                    // Puntero a la columna de retrasos de llegada en la GPU
 char* d_tailNums = nullptr;                     // Puntero a la columna de tailNums en la GPU, se mantiene como char* para facilitar el manejo de strings de longitud variable
-// TODO:extra, es necesario?
 int* d_originSeqId = nullptr;                   // Puntero a la columna de originSeqId en la GPU
 int* d_destSeqId = nullptr;                     // Puntero a la columna de destSeqId en la GPU
 int* d_originAirportCodes = nullptr;            // Puntero a la columna de códigos de aeropuerto de origen en la GPU, se mantiene como int* para facilitar el manejo de códigos de aeropuerto mapeados a enteros
@@ -112,7 +111,7 @@ bool queryGpuInfo()
  * @param totalElements Número total de elementos a procesar.
  * @return La configuración de lanzamiento.
  */
-LaunchConfig computeLaunchConfig(int totalElements) //TODO: revisar para hjacer mejor, ampliar numero de hilos maximo a capacidad del dispositivo?
+LaunchConfig computeLaunchConfig(int totalElements) 
 {
     LaunchConfig launchConfig; // Inicializar con valores predeterminados
     const int maxThreads = g_deviceProp.maxThreadsPerBlock > 0 ? g_deviceProp.maxThreadsPerBlock : 1; // Asegurar que el número máximo de hilos por bloque sea al menos 1
