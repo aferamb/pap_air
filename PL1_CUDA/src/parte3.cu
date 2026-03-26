@@ -80,74 +80,94 @@ __global__ void reductionSimple(int* data, int* result, int n, bool isMax)
     }
 }
 
+/** @brief Realiza una reducción básica en la memoria compartida.
+ *  Esta reduccion la realiza cada hilo comparando su elemento con el anterior y el siguiente, y luego realiza una reducción atómica con el mejor valor encontrado. 
+ * y guarda el resultado en memoria global. 
+ * @param data Puntero a los datos.
+ * @param result Puntero al resultado.
+ * @param n Número de elementos.
+ * @param isMax Indica si se desea obtener el máximo (true) o el mínimo (false).
+ */
 __global__ void reductionBasic(const int* data, int* result, int n, bool isMax)
 {
-    extern __shared__ int sharedWindow[];
-    const int globalIndex = blockIdx.x * blockDim.x + threadIdx.x;
-    const int localIndex = threadIdx.x;
-    const int blockStart = blockIdx.x * blockDim.x;
-    const int identity = isMax ? INT_MIN : INT_MAX;
-    int validElementsInBlock = n - blockStart;
+    extern __shared__ int sharedWindow[]; // Tamaño de bloque + 2 para almacenar el elemento anterior y siguiente
+    const int globalIndex = blockIdx.x * blockDim.x + threadIdx.x; // Índice global del hilo
+    const int localIndex = threadIdx.x; // Índice local dentro del bloque
+    const int blockStart = blockIdx.x * blockDim.x; // Índice del primer elemento del bloque
+    const int identity = isMax ? INT_MIN : INT_MAX; 
+    int validElementsInBlock = n - blockStart; // Número de elementos válidos en el bloque
+    // Ajustar el número de elementos válidos en el bloque para no exceder el tamaño del bloque
     if (validElementsInBlock < 0) {
         validElementsInBlock = 0;
     }
     if (validElementsInBlock > blockDim.x) {
         validElementsInBlock = blockDim.x;
     }
-    sharedWindow[localIndex + 1] = globalIndex < n ? data[globalIndex] : identity;
+    sharedWindow[localIndex + 1] = globalIndex < n ? data[globalIndex] : identity; /// Cargar el elemento actual en la ventana compartida, o el valor identidad si el índice global excede el número de elementos
     if (localIndex == 0) {
-        sharedWindow[0] = blockStart > 0 ? data[blockStart - 1] : identity;
+        sharedWindow[0] = blockStart > 0 ? data[blockStart - 1] : identity; // Cargar el elemento anterior al bloque en la ventana compartida, o el valor identidad si no hay elemento anterior
         if (validElementsInBlock > 0) {
-            const int nextIndex = blockStart + validElementsInBlock;
-            sharedWindow[validElementsInBlock + 1] = nextIndex < n ? data[nextIndex] : identity;
+            const int nextIndex = blockStart + validElementsInBlock; // Índice del elemento siguiente al bloque
+            sharedWindow[validElementsInBlock + 1] = nextIndex < n ? data[nextIndex] : identity; // Cargar el elemento siguiente al bloque en la ventana compartida, o el valor identidad si no hay elemento siguiente
         } else {
-            sharedWindow[1] = identity;
+            sharedWindow[1] = identity; // Si no hay elementos válidos en el bloque, cargar el valor identidad en la posición del siguiente elemento
         }
     }
 
-    __syncthreads();
+    __syncthreads(); // Sincronizar para asegurarse de que todos los hilos han cargado sus datos en la ventana compartida
 
     if (globalIndex >= n) {
         return;
     }
-    int bestValue = deviceCompareReduction(sharedWindow[localIndex], sharedWindow[localIndex + 1], isMax);
-    bestValue = deviceCompareReduction(bestValue, sharedWindow[localIndex + 2], isMax);
+    int bestValue = deviceCompareReduction(sharedWindow[localIndex], sharedWindow[localIndex + 1], isMax); // Comparar el elemento actual con el siguiente en la ventana compartida
+    bestValue = deviceCompareReduction(bestValue, sharedWindow[localIndex + 2], isMax); // Comparar el mejor valor encontrado con el elemento siguiente al siguiente en la ventana compartida
     if (isMax) {
-        atomicMax(result, bestValue);
+        atomicMax(result, bestValue); // Reducción atómica para máximo con el mejor valor encontrado
     } else {
-        atomicMin(result, bestValue);
+        atomicMin(result, bestValue); // Reducción atómica para mínimo con el mejor valor encontrado
     }
 }
 
+/** @brief Realiza una reducción intermedia en la memoria compartida.
+ * Esta reducción es similar a la reducción básica, pero además de comparar el elemento actual con el anterior y el siguiente, 
+ * también compara el mejor valor encontrado por cada hilo con el mejor valor encontrado por su hilo vecino (hilo par con hilo impar) 
+ * para obtener un resultado antes de realizar la reducción atómica en memoria global.
+ * @param data Puntero a los datos.
+ * @param result Puntero al resultado.
+ * @param n Número de elementos.
+ * @param isMax Indica si se desea obtener el máximo (true) o el mínimo (false).
+ */
 __global__ void reductionIntermediate(const int* data, int* result, int n, bool isMax)
 {
-    extern __shared__ int sharedMemory[];
-    int* sharedWindow = sharedMemory;
-    int* sharedLocalBest = sharedMemory + blockDim.x + 2;
+    extern __shared__ int sharedMemory[]; // Tamaño de bloque + 2 para la ventana compartida y tamaño de bloque para almacenar el mejor valor local de cada hilo
+    int* sharedWindow = sharedMemory; // La ventana compartida se almacena al inicio de la memoria compartida
+    int* sharedLocalBest = sharedMemory + blockDim.x + 2; // Los mejores valores locales se almacenan después de la ventana compartida
     const int globalIndex = blockIdx.x * blockDim.x + threadIdx.x;
     const int localIndex = threadIdx.x;
     const int blockStart = blockIdx.x * blockDim.x;
     const int identity = isMax ? INT_MIN : INT_MAX;
     int validElementsInBlock = n - blockStart;
+    // Ajustar el número de elementos válidos en el bloque para no exceder el tamaño del bloque
     if (validElementsInBlock < 0) {
         validElementsInBlock = 0;
     }
     if (validElementsInBlock > blockDim.x) {
         validElementsInBlock = blockDim.x;
     }
-    sharedWindow[localIndex + 1] = globalIndex < n ? data[globalIndex] : identity;
+    sharedWindow[localIndex + 1] = globalIndex < n ? data[globalIndex] : identity; // Cargar el elemento actual en la ventana compartida, o el valor identidad si el índice global excede el número de elementos
     if (localIndex == 0) {
-        sharedWindow[0] = blockStart > 0 ? data[blockStart - 1] : identity;
+        sharedWindow[0] = blockStart > 0 ? data[blockStart - 1] : identity; // Cargar el elemento anterior al bloque en la ventana compartida, o el valor identidad si no hay elemento anterior
         if (validElementsInBlock > 0) {
             const int nextIndex = blockStart + validElementsInBlock;
-            sharedWindow[validElementsInBlock + 1] = nextIndex < n ? data[nextIndex] : identity;
+            sharedWindow[validElementsInBlock + 1] = nextIndex < n ? data[nextIndex] : identity; // Cargar el elemento siguiente al bloque en la ventana compartida, o el valor identidad si no hay elemento siguiente
         } else {
             sharedWindow[1] = identity;
         }
     }
 
-    __syncthreads();
+    __syncthreads(); // Sincronizar para asegurarse de que todos los hilos han cargado sus datos en la ventana compartida
 
+    // Cada hilo calcula su mejor valor local comparando su elemento con el anterior y el siguiente en la ventana compartida
     if (globalIndex < n) {
         int bestValue = deviceCompareReduction(sharedWindow[localIndex], sharedWindow[localIndex + 1], isMax);
         bestValue = deviceCompareReduction(bestValue, sharedWindow[localIndex + 2], isMax);
@@ -155,27 +175,37 @@ __global__ void reductionIntermediate(const int* data, int* result, int n, bool 
     } else {
         sharedLocalBest[localIndex] = identity;
     }
-    __syncthreads();
+    __syncthreads(); // Sincronizar para asegurarse de que todos los hilos han calculado sus mejores valores locales
+
+    // Cada hilo par compara su mejor valor local con el mejor valor local de su hilo vecino impar para obtener un resultado antes de la reducción atómica en memoria global
     if (globalIndex >= n || (globalIndex % 2) != 0) {
         return;
     }
-    int pairBest = sharedLocalBest[localIndex];
+    int pairBest = sharedLocalBest[localIndex]; // El hilo par toma su mejor valor local
     const int nextGlobalIndex = globalIndex + 1;
     if (nextGlobalIndex < n) {
         if (localIndex + 1 < validElementsInBlock) {
-            pairBest = deviceCompareReduction(pairBest, sharedLocalBest[localIndex + 1], isMax);
+            pairBest = deviceCompareReduction(pairBest, sharedLocalBest[localIndex + 1], isMax); // Comparar el mejor valor local del hilo par con el mejor valor local de su hilo vecino impar en la memoria compartida
         } else {
-            pairBest = deviceCompareReduction(pairBest, computeWindowReductionFromGlobal(data, n, nextGlobalIndex, isMax), isMax);
+            pairBest = deviceCompareReduction(pairBest, computeWindowReductionFromGlobal(data, n, nextGlobalIndex, isMax), isMax);  // Si el hilo vecino impar no tiene un valor local válido en la memoria compartida, comparar con el resultado de la reducción de ventana para el elemento del hilo vecino impar en memoria global
         }
     }
 
     if (isMax) {
-        atomicMax(result, pairBest);
+        atomicMax(result, pairBest); // Reducción atómica para máximo con el mejor valor encontrado entre el hilo par y su hilo vecino impar
     } else {
-        atomicMin(result, pairBest);
+        atomicMin(result, pairBest); // Reducción atómica para mínimo con el mejor valor encontrado entre el hilo par y su hilo vecino impar
     }
 }
 
+
+/** @brief Realiza una reducción en patrón de árbol utilizando la memoria compartida.
+ * Esta función realiza una reducción en patrón de árbol utilizando la memoria compartida para comparar elementos adyacentes y reducir el número de operaciones atómicas necesarias en memoria global.
+ * @param input Puntero a los datos de entrada.
+ * @param output Puntero al resultado de la reducción.
+ * @param n Número de elementos.
+ * @param isMax Indica si se desea obtener el máximo (true) o el mínimo (false).
+ */
 __global__ void reductionPattern(const int* input, int* output, int n, bool isMax)
 {
     extern __shared__ int sharedReduction[];
