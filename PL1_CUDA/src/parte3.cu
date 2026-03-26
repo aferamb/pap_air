@@ -18,6 +18,9 @@ enum class Phase3AtomicVariant {
     Intermediate
 };
 
+constexpr int kReductionCpuThreshold = 10; // Umbral para decidir cuándo realizar la reducción final en la CPU después de las reducciones parciales en la GPU
+constexpr int kReductionMaxThreads = 256; // Número máximo de hilos por bloque para la reducción en patrón de árbol, ajustado para evitar problemas de rendimiento en GPUs con un número limitado de hilos por bloque
+
 /** @brief Compara dos valores enteros y devuelve el máximo o mínimo según el parámetro isMax.
  * @param left Primer valor a comparar.
  * @param right Segundo valor a comparar.
@@ -31,6 +34,42 @@ __device__ int deviceCompareReduction(int left, int right, bool isMax)
     }
 
     return left < right ? left : right; // Minimo
+}
+
+/** @brief Reduce la ultima warp en memoria compartida sin sincronizaciones extra.
+ * Documentacionde nVidia https://developer.download.nvidia.com/assets/cuda/files/reduction.pdf
+ * @param sharedReduction Buffer de reduccion en memoria compartida.
+ * @param localIndex Indice local del hilo.
+ * @param blockSize Tamano del bloque, asumido potencia de dos.
+ * @param isMax Indica si se desea obtener el maximo (true) o el minimo (false).
+ */
+__device__ void warpReduceShared(volatile int* sharedReduction, unsigned int localIndex, unsigned int blockSize, bool isMax)
+{
+    // Para bloques de tamaño 64 o más, se necesitan 6 pasos para reducir a un solo valor en la posición 0 del bloque
+    if (blockSize >= 64 && localIndex < 32) {
+        sharedReduction[localIndex] =
+            deviceCompareReduction(sharedReduction[localIndex], sharedReduction[localIndex + 32], isMax);
+    }
+    if (blockSize >= 32 && localIndex < 16) {
+        sharedReduction[localIndex] =
+            deviceCompareReduction(sharedReduction[localIndex], sharedReduction[localIndex + 16], isMax);
+    }
+    if (blockSize >= 16 && localIndex < 8) {
+        sharedReduction[localIndex] =
+            deviceCompareReduction(sharedReduction[localIndex], sharedReduction[localIndex + 8], isMax);
+    }
+    if (blockSize >= 8 && localIndex < 4) {
+        sharedReduction[localIndex] =
+            deviceCompareReduction(sharedReduction[localIndex], sharedReduction[localIndex + 4], isMax);
+    }
+    if (blockSize >= 4 && localIndex < 2) {
+        sharedReduction[localIndex] =
+            deviceCompareReduction(sharedReduction[localIndex], sharedReduction[localIndex + 2], isMax);
+    }
+    if (blockSize >= 2 && localIndex < 1) {
+        sharedReduction[localIndex] =
+            deviceCompareReduction(sharedReduction[localIndex], sharedReduction[localIndex + 1], isMax);
+    }
 }
 
 /** @brief Calcula la reducción de una ventana desde la memoria global.
@@ -199,8 +238,14 @@ __global__ void reductionIntermediate(const int* data, int* result, int n, bool 
 }
 
 
-/** @brief Realiza una reducción en patrón de árbol utilizando la memoria compartida.
- * Esta función realiza una reducción en patrón de árbol utilizando la memoria compartida para comparar elementos adyacentes y reducir el número de operaciones atómicas necesarias en memoria global.
+/** @brief Realiza una reducción en patrón paralelo de reduccion utilizando la memoria compartida.
+ * 
+ * Esta reducción se realiza en varias etapas. En la primera etapa, cada hilo carga un elemento de la memoria global a la memoria compartida y 
+ * realiza una comparación con su elemento vecino para obtener un valor parcial. 
+ * Luego, se realizan reducciones iterativas en la memoria compartida, donde cada hilo compara su valor parcial con el valor parcial de su vecino a una distancia creciente (2, 4, 8, etc.) 
+ * hasta que solo queda un valor parcial por bloque. Finalmente, el hilo 0 de cada bloque escribe el resultado parcial del bloque en la memoria global. 
+ * Este proceso se repite hasta que se obtiene el resultado final.
+ * 
  * @param input Puntero a los datos de entrada.
  * @param output Puntero al resultado de la reducción.
  * @param n Número de elementos.
@@ -209,28 +254,63 @@ __global__ void reductionIntermediate(const int* data, int* result, int n, bool 
 __global__ void reductionPattern(const int* input, int* output, int n, bool isMax)
 {
     extern __shared__ int sharedReduction[];
-    const int globalIndex = blockIdx.x * blockDim.x + threadIdx.x;
-    const int localIndex = threadIdx.x;
+    const unsigned int localIndex = threadIdx.x;
+    const unsigned int baseIndex = blockIdx.x * (blockDim.x * 2) + localIndex;
     const int identity = isMax ? INT_MIN : INT_MAX;
-    sharedReduction[localIndex] = globalIndex < n ? input[globalIndex] : identity;
-    __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+
+    int localBest = identity;
+
+    // Cada hilo carga un elemento de la memoria global a la memoria compartida y realiza una comparación con su elemento vecino para obtener un valor parcial
+    if (baseIndex < static_cast<unsigned int>(n)) {
+        localBest = input[baseIndex];
+    }
+
+    // Comparar con el elemento vecino a la derecha (si existe) para obtener un valor parcial
+    const unsigned int pairedIndex = baseIndex + blockDim.x;
+    if (pairedIndex < static_cast<unsigned int>(n)) {
+        localBest = deviceCompareReduction(localBest, input[pairedIndex], isMax);
+    }
+
+    sharedReduction[localIndex] = localBest;
+    __syncthreads(); // Sincronizar para asegurarse de que todos los hilos han cargado sus valores parciales en la memoria compartida
+
+    // Realizar reducciones iterativas en la memoria compartida, donde cada hilo compara su valor parcial con el valor parcial de su vecino a una distancia creciente (2, 4, 8, etc.) 
+    // hasta que solo queda un valor parcial por bloque
+    for (unsigned int stride = blockDim.x / 2; stride > 32; stride >>= 1) {
         if (localIndex < stride) {
             sharedReduction[localIndex] =
-                deviceCompareReduction(sharedReduction[localIndex], sharedReduction[localIndex + stride], isMax);
+                deviceCompareReduction(sharedReduction[localIndex], sharedReduction[localIndex + stride], isMax); // Comparar el valor parcial del hilo con el valor parcial de su vecino a una distancia creciente en la memoria compartida
         }
-        __syncthreads();
+        __syncthreads(); //Esperamos y sincronizamos :)
     }
+
+    // Realizar la reducción final de la última warp sin sincronizaciones extra
+    if (localIndex < 32) {
+        warpReduceShared(sharedReduction, localIndex, blockDim.x, isMax);
+    }
+
     if (localIndex == 0) {
         output[blockIdx.x] = sharedReduction[0];
     }
 }
 
+/** @brief Obtiene el valor identidad para la reducción.
+ * 
+ * @param isMax Indica si se desea obtener el máximo (true) o el mínimo (false).
+ * @return El valor identidad para la reducción.
+ */
 int getReductionIdentity(bool isMax)
 {
     return isMax ? INT_MIN : INT_MAX;
 }
 
+/** @brief Compara dos valores para la reducción.
+ * 
+ * @param left Primer valor.
+ * @param right Segundo valor.
+ * @param isMax Indica si se desea obtener el máximo (true) o el mínimo (false).
+ * @return El valor comparado.
+ */
 int hostCompareReduction(int left, int right, bool isMax)
 {
     if (isMax) {
@@ -240,6 +320,68 @@ int hostCompareReduction(int left, int right, bool isMax)
     return left < right ? left : right;
 }
 
+/** @brief Calcula la mayor potencia de dos menor o igual a un valor dado.
+ * 
+ * @param value El valor para el cual se desea calcular la potencia de dos.
+ * @return La mayor potencia de dos menor o igual al valor dado.
+ */
+int floorPowerOfTwo(int value)
+{
+    int power = 1;
+
+    while ((power << 1) > 0 && (power << 1) <= value) {
+        power <<= 1;
+    }
+
+    return power;
+}
+
+/** @brief Calcula la configuración de lanzamiento para la reducción en patrón paralelo.
+ * 
+ * Esta función calcula el número de bloques y el número de hilos por bloque para lanzar el kernel de reducción en patrón paralelo, 
+ * teniendo en cuenta el número total de elementos a reducir y las limitaciones de la GPU. 
+ * El número de hilos por bloque se ajusta a la mayor potencia de dos menor o igual al número máximo de hilos por bloque permitido por la GPU, 
+ * con un límite adicional para evitar problemas de rendimiento en GPUs con un número limitado de hilos por bloque. 
+ * El número de bloques se calcula en función del número total de elementos y el número de elementos que cada bloque puede procesar (hilos por bloque * 2).
+ * 
+ * @param totalElements El número total de elementos a reducir.
+ * @return La configuración de lanzamiento calculada para la reducción en patrón paralelo.
+ */
+LaunchConfig computeReductionLaunchConfig(int totalElements)
+{
+    LaunchConfig launchConfig;
+
+    if (totalElements <= 0) {
+        return launchConfig;
+    }
+
+    const int maxThreads = g_deviceProp.maxThreadsPerBlock > 0 ? g_deviceProp.maxThreadsPerBlock : 1; // Ajustar el número de hilos por bloque a la mayor potencia de dos menor o igual al número máximo de hilos por bloque permitido por la GPU, con un límite adicional para evitar problemas de rendimiento en GPUs con un número limitado de hilos por bloque
+    const int cappedThreads = maxThreads < kReductionMaxThreads ? maxThreads : kReductionMaxThreads; // Limitar el número de hilos por bloque a kReductionMaxThreads para evitar problemas de rendimiento en GPUs con un número limitado de hilos por bloque
+
+    launchConfig.threadsPerBlock = floorPowerOfTwo(cappedThreads); // Asegurarse de que el número de hilos por bloque es al menos 1
+    if (launchConfig.threadsPerBlock <= 0) {
+        launchConfig.threadsPerBlock = 1;
+    }
+
+    const int elementsPerBlock = launchConfig.threadsPerBlock * 2; // Cada bloque puede procesar hilos por bloque * 2 elementos debido a la estrategia de reducción en patrón paralelo
+    launchConfig.blocks = (totalElements + elementsPerBlock - 1) / elementsPerBlock; // Calcular el número de bloques necesario para procesar todos los elementos, redondeando hacia arriba
+    return launchConfig;
+}
+
+/** @brief Ejecuta una variante de reducción atómica y obtiene el resultado.
+ * 
+ * Esta función ejecuta una de las variantes de reducción atómica (Simple, Básica o Intermedia) en la GPU, 
+ * utilizando la configuración de lanzamiento proporcionada. Después de ejecutar el kernel, se espera a que la GPU termine la ejecución y se copia el resultado de la reducción desde la memoria global a la memoria host. 
+ * Finalmente, se libera la memoria utilizada para el resultado en la GPU.
+ * 
+ * @param variant La variante de reducción atómica a ejecutar (Simple, Básica o Intermedia).
+ * @param deviceInput Puntero a los datos de entrada en la memoria global de la GPU.
+ * @param totalElements El número total de elementos a reducir.
+ * @param isMax Indica si se desea obtener el máximo (true) o el mínimo (false).
+ * @param launchConfig La configuración de lanzamiento para el kernel de reducción.
+ * @param outResult Referencia para almacenar el resultado de la reducción después de copiarlo desde la GPU.
+ * @return true si la ejecución y obtención del resultado fue exitosa, false en caso contrario.
+ */
 bool phase03AtomicVariant(
     Phase3AtomicVariant variant,
     int* deviceInput,
@@ -250,9 +392,9 @@ bool phase03AtomicVariant(
 {
     int* deviceResult = nullptr;
     std::size_t sharedBytes = 0;
-    const int initialValue = getReductionIdentity(isMax);
-    cudaMalloc(reinterpret_cast<void**>(&deviceResult), sizeof(int));
-    cudaMemcpy(deviceResult, &initialValue, sizeof(int), cudaMemcpyHostToDevice);
+    const int initialValue = getReductionIdentity(isMax); // Obtener el valor identidad para la reducción (INT_MIN para máximo, INT_MAX para mínimo)
+    cudaMalloc(reinterpret_cast<void**>(&deviceResult), sizeof(int)); // Reservar memoria en la GPU para el resultado de la reducción
+    cudaMemcpy(deviceResult, &initialValue, sizeof(int), cudaMemcpyHostToDevice); // Copiar el valor identidad a la memoria de la GPU para inicializar el resultado de la reducción
 
     if (variant == Phase3AtomicVariant::Simple) {
         reductionSimple<<<launchConfig.blocks, launchConfig.threadsPerBlock>>>(
@@ -290,8 +432,8 @@ bool phase03ReductionVariant(int* deviceInput, int totalElements, bool isMax, in
     int* currentInput = deviceInput;
     bool ownsCurrentInput = false;
     int currentCount = totalElements;
-    while (currentCount > 10) {
-        const LaunchConfig launchConfig = computeLaunchConfig(currentCount);
+    while (currentCount > kReductionCpuThreshold) {
+        const LaunchConfig launchConfig = computeReductionLaunchConfig(currentCount);
         const std::size_t partialBytes = static_cast<std::size_t>(launchConfig.blocks) * sizeof(int);
         const std::size_t sharedBytes = static_cast<std::size_t>(launchConfig.threadsPerBlock) * sizeof(int);
         int* devicePartials = nullptr;
