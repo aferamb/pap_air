@@ -157,13 +157,13 @@ cudaError_t copyPhase2FilterConfigToConstant(int mode, int threshold)
 /*
     phase1DepartureDelayKernel
 
-    Cada hilo procesa una fila del vector DEP_DELAY ya truncado a entero. La
-    mascara de validez permite ignorar datos que en host eran NAN sin tener que
-    compactar el dataset ni perder el indice global original.
+    Cada hilo procesa una fila del vector DEP_DELAY cacheado en GPU. Si el
+    valor original es NAN, el propio kernel ignora esa posicion. El truncado a
+    entero se hace aqui mismo porque la practica solo necesita el entero al
+    comparar e imprimir.
 */
 __global__ void phase1DepartureDelayKernel(
-    const int* delayValues,
-    const unsigned char* validMask,
+    const float* delayValues,
     int totalElements,
     int mode,
     int threshold)
@@ -177,13 +177,14 @@ __global__ void phase1DepartureDelayKernel(
         return;
     }
 
-    // Si el dato original era NAN, el host deja una mascara a 0 para que este
-    // hilo ignore la posicion y no imprima un valor inventado.
-    if (validMask[idx] == 0) {
+    const float rawValue = delayValues[idx];
+
+    // Un NAN representa un dato ausente en el CSV y se ignora directamente.
+    if (rawValue != rawValue) {
         return;
     }
 
-    const int delayValue = delayValues[idx];
+    const int delayValue = static_cast<int>(rawValue);
 
     const bool matchesThreshold = matchesDelayFilterMode(delayValue, mode, threshold);
 
@@ -197,12 +198,11 @@ __global__ void phase1DepartureDelayKernel(
     phase2ArrivalDelayKernel
 
     Cada hilo analiza una fila de ARR_DELAY y, si cumple el umbral constante,
-    reserva una posicion libre en la salida con una operacion atomica. Despues
-    copia tanto el retraso detectado como la matricula asociada.
+    reserva una posicion libre en la salida con una operacion atomica. El dato
+    numerico entra como float y se trunca en el propio kernel.
 */
 __global__ void phase2ArrivalDelayKernel(
-    const int* delayValues,
-    const unsigned char* validMask,
+    const float* delayValues,
     const char* tailNumIn,
     int totalElements,
     int* outCount,
@@ -216,11 +216,13 @@ __global__ void phase2ArrivalDelayKernel(
         return;
     }
 
-    if (validMask[idx] == 0) {
+    const float rawValue = delayValues[idx];
+
+    if (rawValue != rawValue) {
         return;
     }
 
-    const int delayValue = delayValues[idx];
+    const int delayValue = static_cast<int>(rawValue);
 
     // El modo y el umbral viven en memoria constante para cumplir el requisito
     // del enunciado y porque son valores comunes a todos los hilos.

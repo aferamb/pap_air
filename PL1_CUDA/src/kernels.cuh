@@ -28,23 +28,21 @@ constexpr int kPhase2TailNumStride = 16;
     phase1DepartureDelayKernel
 
     Kernel de la Fase 01. Cada hilo analiza una posicion del vector DEP_DELAY
-    ya truncado a entero en host. Si el dato es valido y supera el criterio del
-    umbral, el hilo muestra por consola:
+    ya cacheado en GPU como float. Si el dato es valido y supera el criterio
+    del umbral, el hilo muestra por consola:
 
     - su identificador global;
     - el valor detectado.
 
     Parametros:
 
-    - delayValues: vector de retrasos truncados a entero;
-    - validMask: mascara 0/1 para ignorar posiciones que en host eran NAN;
+    - delayValues: vector de retrasos en float;
     - totalElements: numero total de filas procesables;
     - mode: 1=retraso, 2=adelanto, 3=ambos;
     - threshold: umbral absoluto no negativo introducido por el usuario.
 */
 __global__ void phase1DepartureDelayKernel(
-    const int* delayValues,
-    const unsigned char* validMask,
+    const float* delayValues,
     int totalElements,
     int mode,
     int threshold);
@@ -70,8 +68,7 @@ cudaError_t copyPhase2FilterConfigToConstant(int mode, int threshold);
 
     Parametros:
 
-    - delayValues: vector ARR_DELAY truncado a entero;
-    - validMask: mascara 0/1 para ignorar NAN;
+    - delayValues: vector ARR_DELAY en float;
     - tailNumIn: buffer linealizado de matriculas de entrada;
     - totalElements: numero total de filas;
     - outCount: contador global de resultados encontrados;
@@ -79,8 +76,7 @@ cudaError_t copyPhase2FilterConfigToConstant(int mode, int threshold);
     - outTailNumBuffer: array simple de matriculas detectadas.
 */
 __global__ void phase2ArrivalDelayKernel(
-    const int* delayValues,
-    const unsigned char* validMask,
+    const float* delayValues,
     const char* tailNumIn,
     int totalElements,
     int* outCount,
