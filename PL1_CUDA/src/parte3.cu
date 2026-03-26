@@ -396,6 +396,7 @@ bool phase03AtomicVariant(
     cudaMalloc(reinterpret_cast<void**>(&deviceResult), sizeof(int)); // Reservar memoria en la GPU para el resultado de la reducción
     cudaMemcpy(deviceResult, &initialValue, sizeof(int), cudaMemcpyHostToDevice); // Copiar el valor identidad a la memoria de la GPU para inicializar el resultado de la reducción
 
+    // Ejecutar la variante de reducción atómica seleccionada en la GPU utilizando la configuración de lanzamiento proporcionada
     if (variant == Phase3AtomicVariant::Simple) {
         reductionSimple<<<launchConfig.blocks, launchConfig.threadsPerBlock>>>(
             deviceInput,
@@ -418,52 +419,69 @@ bool phase03AtomicVariant(
             totalElements,
             isMax);
     }
-    if (!executeAndWait("Fase 03 atomica")) {
+    if (!executeAndWait("Fase 03 atomica")) { // Esperar a que la GPU termine la ejecución del kernel y verificar si hubo errores
         cudaFree(deviceResult);
         return false;
     }
-    cudaMemcpy(&outResult, deviceResult, sizeof(int), cudaMemcpyDeviceToHost);
-    cudaFree(deviceResult);
+    cudaMemcpy(&outResult, deviceResult, sizeof(int), cudaMemcpyDeviceToHost); // Copiar el resultado de la reducción desde la memoria global de la GPU a la memoria host
+    cudaFree(deviceResult);                                                    // Liberar la memoria utilizada para el resultado en la GPU. be free my dear memory ;)
     return true;
 }
 
+/** @brief Realiza una reducción utilizando un patrón paralelo de reducción en la GPU.
+ * 
+ * Esta función realiza una reducción utilizando un patrón paralelo de reducción en la GPU, donde se lanzan múltiples kernels de reducción en patrón paralelo de manera iterativa hasta que el número de elementos a reducir es menor o igual a un umbral definido (kReductionCpuThreshold). 
+ * En cada iteración, se calcula la configuración de lanzamiento para el kernel de reducción en patrón paralelo, se reserva memoria para los resultados parciales, se ejecuta el kernel y se espera a que termine la ejecución. 
+ * Después de cada kernel, se actualiza el puntero a los datos de entrada para la siguiente iteración con los resultados parciales obtenidos. 
+ * Finalmente, cuando el número de elementos a reducir es menor o igual al umbral, se copian los resultados parciales restantes a la memoria host y se realiza la reducción final en la CPU para obtener el resultado final.
+ * 
+ * @param deviceInput Puntero a los datos de entrada en la memoria global de la GPU.
+ * @param totalElements El número total de elementos a reducir.
+ * @param isMax Indica si se desea obtener el máximo (true) o el mínimo (false).
+ * @param outResult Referencia para almacenar el resultado final de la reducción después de copiarlo desde la GPU y realizar la reducción final en la CPU.
+ * @return true si la reducción se realizó exitosamente, false en caso contrario.
+ */
 bool phase03ReductionVariant(int* deviceInput, int totalElements, bool isMax, int& outResult)
 {
-    int* currentInput = deviceInput;
-    bool ownsCurrentInput = false;
-    int currentCount = totalElements;
+    int* currentInput = deviceInput; // Puntero a los datos de entrada para la iteración actual, inicialmente apunta a los datos de entrada originales en la GPU
+    bool ownsCurrentInput = false; // Indica si la función es responsable de liberar la memoria apuntada por currentInput, inicialmente es false porque no se ha reservado memoria adicional para los resultados parciales
+    int currentCount = totalElements; 
+
+    // Realizar reducciones iterativas en la GPU utilizando el patrón paralelo de reducción hasta que el número de elementos a reducir sea menor o igual al umbral definido (kReductionCpuThreshold)
     while (currentCount > kReductionCpuThreshold) {
-        const LaunchConfig launchConfig = computeReductionLaunchConfig(currentCount);
+        const LaunchConfig launchConfig = computeReductionLaunchConfig(currentCount); // Calcular la configuración de lanzamiento para el kernel de reducción en patrón paralelo en función del número actual de elementos a reducir
         const std::size_t partialBytes = static_cast<std::size_t>(launchConfig.blocks) * sizeof(int);
         const std::size_t sharedBytes = static_cast<std::size_t>(launchConfig.threadsPerBlock) * sizeof(int);
         int* devicePartials = nullptr;
-        cudaMalloc(reinterpret_cast<void**>(&devicePartials), partialBytes);
-        reductionPattern<<<launchConfig.blocks, launchConfig.threadsPerBlock, sharedBytes>>>(
+        cudaMalloc(reinterpret_cast<void**>(&devicePartials), partialBytes); // Reservar memoria en la GPU para los resultados parciales de la reducción de esta iteración
+        reductionPattern<<<launchConfig.blocks, launchConfig.threadsPerBlock, sharedBytes>>>( 
             currentInput,
             devicePartials,
             currentCount,
             isMax);
-        if (!executeAndWait("reductionPattern")) {
+        if (!executeAndWait("reductionPattern")) { // Esperar a que la GPU termine la ejecución del kernel de reducción en patrón paralelo y verificar si hubo errores
             cudaFree(devicePartials);
             if (ownsCurrentInput) {
                 cudaFree(currentInput);
             }
             return false;
         }
-        if (ownsCurrentInput) {
+        if (ownsCurrentInput) { // Si la función es responsable de liberar la memoria apuntada por currentInput, liberar esa memoria antes de actualizar el puntero a los datos de entrada para la siguiente iteración
             cudaFree(currentInput);
         }
         currentInput = devicePartials;
         ownsCurrentInput = true;
         currentCount = launchConfig.blocks;
     }
-    std::vector<int> hostFinalValues(static_cast<std::size_t>(currentCount));
+    std::vector<int> hostFinalValues(static_cast<std::size_t>(currentCount)); // Vector para almacenar los resultados parciales restantes después de las reducciones iterativas en la GPU, que serán copiados a la memoria host para realizar la reducción final en la CPU
     cudaMemcpy(
         hostFinalValues.data(),
         currentInput,
         static_cast<std::size_t>(currentCount) * sizeof(int),
         cudaMemcpyDeviceToHost);
     outResult = hostFinalValues[0];
+
+    // Realizar la reducción final en la CPU para obtener el resultado final, comparando los resultados parciales restantes copiados a la memoria host
     for (int i = 1; i < currentCount; ++i) {
         outResult = hostCompareReduction(outResult, hostFinalValues[static_cast<std::size_t>(i)], isMax);
     }
@@ -475,10 +493,19 @@ bool phase03ReductionVariant(int* deviceInput, int totalElements, bool isMax, in
 
 } // namespace
 
+/** @brief Función principal para la fase 03, que realiza reducciones atómicas y en patrón paralelo para obtener el máximo o mínimo de una columna específica del dataset.
+ * 
+ * Esta función selecciona la columna del dataset a procesar según el parámetro columnOption, determina si se desea obtener el máximo o mínimo según el parámetro reductionOption, y prepara los datos de entrada para la reducción. 
+ * Luego, ejecuta las variantes de reducción atómica (Simple, Básica e Intermedia) y la reducción en patrón paralelo, obteniendo los resultados de cada una. Finalmente, imprime los resultados obtenidos para cada variante de reducción.
+ * 
+ * @param columnOption Opción para seleccionar la columna del dataset (1 para DEP_DELAY, 2 para ARR_DELAY, 3 para WEATHER_DELAY).
+ * @param reductionOption Opción para seleccionar el tipo de reducción (1 para máximo, 2 para mínimo).
+ */
 void phase03(int columnOption, int reductionOption)
 {
     const std::vector<float>* sourceColumn = &g_dataset.depDelay;
-    const char* columnLabel = "DEP_DELAY";
+    const char* columnLabel = "DEP_DELAY"; // Columna por defecto es DEP_DELAY
+    // Seleccionar la columna del dataset a procesar según el parámetro columnOption
     if (columnOption == 2) {
         sourceColumn = &g_dataset.arrDelay;
         columnLabel = "ARR_DELAY";
@@ -490,10 +517,10 @@ void phase03(int columnOption, int reductionOption)
     const char* reductionLabel = isMax ? "Maximo" : "Minimo";
     const char* reductionFunctionLabel = isMax ? "Max" : "Min";
     std::vector<int> inputValues;
-    inputValues.reserve(sourceColumn->size());
+    inputValues.reserve(sourceColumn->size()); // Reservar memoria para los valores de entrada, asumiendo que la mayoría de los valores serán válidos (no NaN)
     for (std::size_t i = 0; i < sourceColumn->size(); ++i) {
         if (!std::isnan((*sourceColumn)[i])) {
-            inputValues.push_back(static_cast<int>((*sourceColumn)[i]));
+            inputValues.push_back(static_cast<int>((*sourceColumn)[i])); // Convertir los valores de la columna a enteros para la reducción, asumiendo que los valores son tiempos de retraso en minutos y se pueden representar como enteros
         }
     }
     const int totalElements = static_cast<int>(inputValues.size());
@@ -501,18 +528,21 @@ void phase03(int columnOption, int reductionOption)
         std::cout << "No hay valores validos para la Fase 03.\n";
         return;
     }
-    const LaunchConfig launchConfig = computeLaunchConfig(totalElements);
+    const LaunchConfig launchConfig = computeLaunchConfig(totalElements); // Calcular la configuración de lanzamiento para las variantes de reducción atómica en función del número total de elementos a reducir
     std::cout << columnLabel
               << " | " << reductionLabel
               << " | validos " << totalElements
               << " | " << launchConfig.blocks << " x " << launchConfig.threadsPerBlock << "\n";
     int* deviceInput = nullptr;
-    cudaMalloc(reinterpret_cast<void**>(&deviceInput), inputValues.size() * sizeof(int));
-    cudaMemcpy(deviceInput, inputValues.data(), inputValues.size() * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMalloc(reinterpret_cast<void**>(&deviceInput), inputValues.size() * sizeof(int)); // Reservar memoria en la GPU para los datos de entrada de la reducción
+    cudaMemcpy(deviceInput, inputValues.data(), inputValues.size() * sizeof(int), cudaMemcpyHostToDevice); // Copiar los datos de entrada desde la memoria host a la memoria global de la GPU para la reducción
     int simpleResult = 0;
     int basicResult = 0;
     int intermediateResult = 0;
     int reductionResult = 0;
+
+    // Ejecutar las variantes de reducción atómica (Simple, Básica e Intermedia) y la reducción en patrón paralelo, obteniendo los resultados de cada una. 
+    // Si alguna de las ejecuciones falla, liberar la memoria utilizada para los datos de entrada y salir de la función.
     if (!phase03AtomicVariant(Phase3AtomicVariant::Simple, deviceInput, totalElements, isMax, launchConfig, simpleResult) ||
         !phase03AtomicVariant(Phase3AtomicVariant::Basic, deviceInput, totalElements, isMax, launchConfig, basicResult) ||
         !phase03AtomicVariant(Phase3AtomicVariant::Intermediate, deviceInput, totalElements, isMax, launchConfig, intermediateResult) ||
@@ -521,7 +551,8 @@ void phase03(int columnOption, int reductionOption)
         std::cout << "La Fase 03 no se ha podido completar.\n";
         return;
     }
-    cudaFree(deviceInput);
+    // Imprimir los resultados obtenidos para cada variante de reducción y liberar la memoria utilizada para los datos de entrada en la GPU. 
+    cudaFree(deviceInput); // be free my dear input memory ;)
     std::cout << "\n[Simple] " << reductionFunctionLabel << "() " << columnLabel
               << " = " << simpleResult << " minutos\n";
     std::cout << "[Basica] " << reductionFunctionLabel << "() " << columnLabel
