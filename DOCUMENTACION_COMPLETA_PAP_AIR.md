@@ -1539,6 +1539,333 @@ flowchart LR
     B --> I[Fase 04]
 ```
 
+## 14.1.1. Para que se usa cada tipo de memoria
+
+### Memoria host
+
+Es la memoria normal del programa C++:
+
+- vive en RAM del sistema;
+- la maneja la CPU;
+- usa contenedores como `std::vector`, `std::string` y `std::unordered_map`.
+
+En este proyecto se usa para:
+
+- cargar el CSV;
+- conservar el dataset completo;
+- compactar Fase 03;
+- traducir `SEQ_ID` a codigo en Fase 04;
+- imprimir resultados.
+
+### Memoria global de GPU
+
+Es la memoria principal del dispositivo CUDA:
+
+- accesible por todos los bloques y hilos;
+- mas grande que la compartida;
+- mas lenta que la compartida;
+- ideal para guardar columnas completas del dataset.
+
+Se usa para:
+
+- `d_depDelay`
+- `d_arrDelay`
+- `d_tailNums`
+- buffers de salida de Fase 02
+- entradas densas de Fase 04
+- parciales y resultados temporales de Fase 03 y Fase 04
+
+### Memoria compartida
+
+Es memoria local al bloque:
+
+- rapida;
+- pequena;
+- visible solo para los hilos de un mismo bloque.
+
+Se usa cuando los hilos del bloque colaboran, por ejemplo:
+
+- ventana `anterior-actual-siguiente` en Fase 03 basica;
+- mejores locales por pareja en Fase 03 intermedia;
+- reduccion por mitades en Fase 03 patron;
+- histograma parcial por bloque en Fase 04.
+
+### Memoria constante
+
+Es memoria de solo lectura para los kernels, escrita desde CPU:
+
+- muy util cuando todos los hilos leen el mismo valor;
+- evita repetir la misma configuracion en parametros y cargas globales.
+
+En este proyecto se usa para:
+
+- `d_phase2Threshold`
+
+porque todos los hilos de Fase 02 comparan contra el mismo umbral.
+
+## 14.1.2. Esquema de memoria por fase
+
+| Fase | Host | Global GPU | Shared | Constante |
+|---|---|---|---|---|
+| 0 | CSV, vectores, mapas, resumen | No | No | No |
+| 01 | CLI y lanzamiento | `d_depDelay` | No | No |
+| 02 | CLI, recuperacion de salida | `d_arrDelay`, `d_tailNums`, buffers de salida | No | `d_phase2Threshold` |
+| 03 | Compactado y cierre CPU de 3.4 | `deviceInput`, `deviceResult`, `devicePartials` | Si | No |
+| 04 | Impresion textual | `d_originDenseInput` o `d_destinationDenseInput`, parciales, final | Si | No |
+
+## 14.1.3. Ciclo de vida de la memoria en el proyecto
+
+```mermaid
+flowchart TD
+    A[CSV en disco] --> B[Memoria host C++]
+    B --> C[subirDatasetAGPU]
+    C --> D[Global GPU reutilizable]
+    D --> E[Fase 01]
+    D --> F[Fase 02]
+    D --> G[Fase 04]
+    B --> H[Compactado temporal Fase 03]
+    H --> I[Buffers temporales Fase 03]
+    D --> J[liberarGPU]
+    I --> J
+```
+
+## 14.1.4. Como se reserva y libera memoria
+
+### `cudaMalloc`
+
+`cudaMalloc` reserva memoria en la GPU.
+
+Ejemplo conceptual:
+
+```cpp
+cudaMalloc(reinterpret_cast<void**>(&d_depDelay), delayBytes);
+```
+
+Esto significa:
+
+- `d_depDelay` pasara a apuntar a un bloque de memoria device;
+- el tamano reservado es `delayBytes`;
+- esa memoria no contiene datos validos hasta que se copie algo dentro.
+
+### `cudaFree`
+
+`cudaFree` libera un bloque reservado antes con `cudaMalloc`.
+
+En el proyecto suele ir seguido de:
+
+```cpp
+d_depDelay = nullptr;
+```
+
+para dejar claro que el puntero ya no apunta a memoria valida.
+
+### `cudaMemcpy`
+
+`cudaMemcpy` copia datos entre host y device.
+
+En este proyecto aparecen sobre todo tres patrones:
+
+#### 1. Host -> Device
+
+```cpp
+cudaMemcpy(d_depDelay, dataset.depDelay.data(), delayBytes, cudaMemcpyHostToDevice);
+```
+
+Se usa para subir columnas o buffers ya preparados.
+
+#### 2. Device -> Host
+
+```cpp
+cudaMemcpy(&resultCount, d_phase2Count, sizeof(int), cudaMemcpyDeviceToHost);
+```
+
+Se usa para recuperar:
+
+- contadores;
+- resultados de reduccion;
+- histogramas;
+- vectores de salida.
+
+#### 3. Device -> Device
+
+No es el patron principal de este proyecto. La mayor parte de los datos se
+mueven entre host y device, no entre dos buffers device distintos.
+
+### `cudaMemset`
+
+Se usa para inicializar a cero un buffer GPU, por ejemplo el contador de
+resultados de Fase 02:
+
+```cpp
+cudaMemset(d_phase2Count, 0, sizeof(int));
+```
+
+### `cudaMemcpyToSymbol`
+
+Sirve para copiar desde CPU a una variable `__constant__`:
+
+```cpp
+cudaMemcpyToSymbol(d_phase2Threshold, &threshold, sizeof(int));
+```
+
+Es la forma tipica de rellenar memoria constante.
+
+## 14.1.5. Como interactuan host y device
+
+La CPU nunca "toca" directamente la memoria GPU como si fuera RAM normal. La
+interaccion siempre se hace por APIs CUDA.
+
+Secuencia general:
+
+1. CPU construye datos en RAM.
+2. CPU reserva memoria device con `cudaMalloc`.
+3. CPU copia datos con `cudaMemcpy`.
+4. CPU lanza un kernel.
+5. GPU ejecuta en paralelo.
+6. CPU sincroniza.
+7. CPU recupera resultados con `cudaMemcpy`.
+
+En otras palabras:
+
+- la CPU prepara y coordina;
+- la GPU calcula;
+- la CPU vuelve a presentar resultados.
+
+## 14.1.6. Funciones base de C/C++ usadas en el proyecto
+
+### `std::vector`
+
+Es el contenedor base del proyecto. Se usa para:
+
+- columnas del dataset;
+- buffers temporales;
+- vectores de parciales;
+- histogramas en CPU.
+
+Su papel es importante porque permite:
+
+- almacenamiento contiguo;
+- acceso por indice;
+- pasar `data()` a `cudaMemcpy`.
+
+### `std::string`
+
+Se usa para:
+
+- rutas;
+- matriculas;
+- codigos de aeropuerto;
+- mensajes de error.
+
+No se usa dentro de GPU. Antes de cruzar a device, se transforma a buffer
+lineal de `char`.
+
+### `std::unordered_map`
+
+Se usa como tabla hash para:
+
+- `SEQ_ID -> codigo`
+- `SEQ_ID -> denseIndex`
+
+Su ventaja aqui es que la busqueda media es cercana a O(1), lo que simplifica
+mucho la densificacion y la traduccion de IDs.
+
+### `std::getline`
+
+Es la base de la entrada por consola y de la lectura del CSV:
+
+- en CLI evita dejar restos de buffer de `std::cin`;
+- en el CSV permite leer una linea completa antes de trocearla.
+
+### `std::stringstream`
+
+Se usa en la CLI para parsear texto introducido por el usuario y detectar si el
+contenido es realmente un entero limpio o lleva basura extra.
+
+Ejemplo:
+
+```cpp
+std::stringstream parser(input);
+int parsedValue = 0;
+char trailingCharacter = '\0';
+```
+
+La funcion comprueba:
+
+- que se pudo leer un entero;
+- que no queda ningun caracter sobrante.
+
+### `std::stof`
+
+Convierte texto a `float` en `parseFloatOrNan`.
+
+Se combina con:
+
+- manejo de excepciones;
+- verificacion del numero de caracteres consumidos.
+
+### `std::isnan`
+
+Es fundamental en host para detectar datos ausentes:
+
+- al contar faltantes;
+- al compactar Fase 03.
+
+### `static_cast<int>`
+
+Se usa para truncar `float` a `int`.
+
+En este proyecto no se redondea: se trunca hacia cero.
+
+Ejemplos:
+
+- `4.9 -> 4`
+- `-4.9 -> -4`
+
+## 14.1.7. Funciones base de CUDA usadas en el proyecto
+
+### `cudaGetDeviceCount`
+
+Comprueba si hay GPU CUDA disponible.
+
+### `cudaGetDeviceProperties`
+
+Lee:
+
+- nombre de GPU;
+- compute capability;
+- memoria global;
+- memoria compartida por bloque;
+- maximo de hilos por bloque.
+
+Es la base de `queryGpuInfo()` y `computeLaunchConfig()`.
+
+### `cudaGetLastError`
+
+Detecta si el lanzamiento del kernel fue correcto.
+
+### `cudaDeviceSynchronize`
+
+Bloquea a la CPU hasta que el kernel termina. Sin esto:
+
+- no se sabria si el kernel fallo realmente;
+- los `printf` device podrian no haberse vaciado aun;
+- las copias de resultados podrian ejecutarse demasiado pronto.
+
+### `atomicAdd`
+
+Aparece en:
+
+- `phase2ArrivalDelayKernel`
+- `phase4SharedHistogramKernel`
+
+Se usa cuando varios hilos escriben sobre un mismo contador o bin.
+
+### `atomicMax` y `atomicMin`
+
+Aparecen en Fase 03 para variantes con acumulador global. Garantizan que la
+actualizacion del resultado no se corrompa cuando muchos hilos compiten.
+
 ## 14.2. `matchesSignedThreshold`
 
 Unifica la logica de Fases 01 y 02:
@@ -1664,6 +1991,47 @@ decision de simplicidad:
 - menos postprocesado;
 - salida estable respecto al flujo del dataset.
 
+## 16.7. Reflexiones tecnicas cortas
+
+### Sobre la simplicidad
+
+La arquitectura actual no intenta esconder el programa tras demasiadas capas.
+Eso hace que algunas cosas sean menos elegantes, pero tambien hace mas visible:
+
+- donde vive cada dato;
+- cuando se sube a GPU;
+- cuando se libera;
+- que fase usa cada columna.
+
+### Sobre el equilibrio host/GPU
+
+El proyecto no envia todo a GPU ni deja todo en CPU. Hace una mezcla bastante
+razonable para una practica:
+
+- dataset base compartido en GPU para fases repetidas;
+- `WEATHER_DELAY` y compactado de Fase 03 en CPU por simplicidad;
+- impresion final en CPU, donde tiene sentido.
+
+### Sobre el coste real de las fases
+
+No todas las fases cuestan igual:
+
+- Fase 01 es muy ligera;
+- Fase 02 ya introduce compaccion y atomicas;
+- Fase 03 es la parte mas didactica y mas variada;
+- Fase 04 mezcla preprocesado host y colaboracion por bloque.
+
+### Sobre la documentacion del codigo
+
+Una idea importante al estudiar este proyecto es no verlo solo como "un
+programa que funciona", sino como un conjunto de patrones CUDA pequenos:
+
+- indexacion 1D;
+- filtrado con umbral;
+- compaccion con contador atomico;
+- reducciones por distintas estrategias;
+- histogramas con shared memory.
+
 ---
 
 ## 17. Resumen final por fase
@@ -1700,7 +2068,7 @@ salida.
 
 ---
 
-## 19. Conclusiones tecnicas
+## 20. Conclusiones tecnicas
 
 El proyecto actual sigue una estrategia muy concreta:
 
