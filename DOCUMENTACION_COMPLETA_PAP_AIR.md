@@ -50,14 +50,14 @@ cosas principales:
 
 | Archivo | Lineas aprox. | Papel |
 |---|---:|---|
-| `PL1_CUDA/src/main.cu` | 329 | CLI y bucle principal |
-| `PL1_CUDA/src/comun.cuh/.cu` | 200 | Globals compartidas, GPU y utilidades comunes |
-| `PL1_CUDA/src/csv_reader.h/.cpp` | 361 | Carga y limpieza del CSV |
-| `PL1_CUDA/src/dataset_gpu.cuh/.cu` | 298 | Fase 0 real y dataset persistente en GPU |
-| `PL1_CUDA/src/parte1.cuh/.cu` | 76 | Fase 01 |
-| `PL1_CUDA/src/parte2.cuh/.cu` | 155 | Fase 02 |
-| `PL1_CUDA/src/parte3.cuh/.cu` | 347 | Fase 03 |
-| `PL1_CUDA/src/parte4.cuh/.cu` | 212 | Fase 04 |
+| `PL1_CUDA/src/main.cu` | 395 | CLI y bucle principal |
+| `PL1_CUDA/src/comun.cuh/.cu` | 239 | Globals compartidas, GPU y utilidades comunes |
+| `PL1_CUDA/src/csv_reader.h/.cpp` | 421 | Carga y limpieza del CSV |
+| `PL1_CUDA/src/dataset_gpu.cuh/.cu` | 326 | Fase 0 real y dataset persistente en GPU |
+| `PL1_CUDA/src/parte1.cuh/.cu` | 88 | Fase 01 |
+| `PL1_CUDA/src/parte2.cuh/.cu` | 196 | Fase 02 |
+| `PL1_CUDA/src/parte3.cuh/.cu` | 573 | Fase 03 |
+| `PL1_CUDA/src/parte4.cuh/.cu` | 254 | Fase 04 |
 
 ### 1.3. Arquitectura por modulos
 
@@ -272,6 +272,23 @@ modulos de fase compartan estado sin firmas largas.
 | `d_phase2OutTailNums` | `char*` | Matriculas detectadas en Fase 02 |
 | `d_originDenseInput` | `int*` | Entrada densa origen para histograma |
 | `d_destinationDenseInput` | `int*` | Entrada densa destino para histograma |
+
+### Device declaradas pero sin uso operativo actual
+
+En `comun.cuh/.cu` tambien aparecen estas globals device:
+
+- `d_originSeqId`
+- `d_destSeqId`
+- `d_originAirportCodes`
+- `d_destAirportCodes`
+
+Hoy forman parte del estado global declarado, pero el flujo real del programa
+no las reserva ni las usa en ninguna fase. La Fase 04 trabaja con
+`d_originDenseInput` y `d_destinationDenseInput`, no con estas cuatro
+columnas. Por eso conviene distinguir entre:
+
+- estado device **operativo** del flujo actual;
+- estado device **declarado** pero sin papel funcional hoy.
 
 ### Metadatos de Fase 04
 
@@ -1173,237 +1190,476 @@ buffers que la GPU ya ha producido y los muestra como:
 
 ## 11. Fase 03: reduccion de retrasos
 
-## 11.1. Objetivo
+## 11.1. Objetivo y forma general
 
-Calcular maximo o minimo sobre una columna elegida:
+La Fase 03 calcula un maximo o un minimo sobre una columna elegida del
+dataset:
 
 - `DEP_DELAY`
 - `ARR_DELAY`
 - `WEATHER_DELAY`
 
-La fase ejecuta siempre cuatro variantes didacticas.
+La implementacion ejecuta siempre cuatro variantes:
+
+- `reductionSimple`
+- `reductionBasic`
+- `reductionIntermediate`
+- `reductionPattern`
+
+Las tres primeras comparten una ruta host comun (`phase03AtomicVariant(...)`) y
+la cuarta sigue otra ruta (`phase03ReductionVariant(...)`) porque su algoritmo y
+su ciclo de vida de memoria son distintos.
+
+### Flujo completo de la fase
+
+```mermaid
+flowchart TD
+    A[phase03] --> B[Seleccionar columna]
+    B --> C[Filtrar NAN y truncar a int]
+    C --> D[Crear inputValues]
+    D --> E[cudaMalloc deviceInput]
+    E --> F[cudaMemcpy host -> device]
+    F --> G[phase03AtomicVariant Simple]
+    F --> H[phase03AtomicVariant Basic]
+    F --> I[phase03AtomicVariant Intermediate]
+    F --> J[phase03ReductionVariant]
+    G --> K[Imprimir resultado]
+    H --> K
+    I --> K
+    J --> K
+```
 
 ## 11.2. Preprocesado host en `phase03`
 
 Antes de tocar GPU, la CPU:
 
-1. elige la columna
-2. recorre todos sus floats
-3. ignora `NAN`
-4. trunca cada valor valido a `int`
-5. crea `inputValues`
-6. copia ese vector compacto a `deviceInput`
+1. selecciona una columna concreta;
+2. recorre todos sus `float`;
+3. descarta los `NAN`;
+4. trunca cada valor valido a `int`;
+5. construye `inputValues`;
+6. copia ese vector compacto a `deviceInput`.
 
-### Importancia de este paso
+La fase trabaja asi porque el dato que reduce no es simplemente "la columna
+bruta", sino una vista preparada para reduccion:
 
-Esto simplifica mucho los kernels porque:
-
-- ya no necesitan filtrar `NAN`;
-- trabajan sobre `int`;
-- `n` es el numero real de elementos validos.
+- sin huecos `NAN`;
+- ya convertida a enteros;
+- con longitud exacta `n = numero de valores validos`.
 
 ### Ejemplo
 
-Si la columna es:
+Si la columna original es:
 
 ```text
-[10.4, NAN, -2.1, 7.9]
+[10.4, NAN, -2.1, 7.9, NAN, 5.0]
 ```
 
-El vector compacto es:
+tras el preprocesado queda:
 
 ```text
-[10, -2, 7]
+[10, -2, 7, 5]
 ```
 
-## 11.3. `getReductionIdentity`
+Ese vector compacto es el que realmente viaja a GPU.
+
+## 11.3. Constantes y helpers base
+
+### `kReductionCpuThreshold`
+
+```cpp
+constexpr int kReductionCpuThreshold = 10;
+```
+
+Marca el punto a partir del cual la variante `reductionPattern` deja de lanzar
+mas kernels y cierra la reduccion final en CPU. La idea es que, cuando solo
+quedan muy pocos valores parciales, la CPU puede terminar el trabajo sin
+complicar mas el pipeline.
+
+### `kReductionMaxThreads`
+
+```cpp
+constexpr int kReductionMaxThreads = 256;
+```
+
+Fija un techo de hilos por bloque para la variante 3.4. Aunque la GPU soporte
+mas, la implementacion mantiene este limite para conservar un patron sencillo,
+potencias de dos y un tamaño razonable de shared memory.
+
+### `getReductionIdentity`
 
 Devuelve la identidad del operador:
 
 - maximo -> `INT_MIN`
 - minimo -> `INT_MAX`
 
-Esto se usa cuando un hueco no tiene dato valido.
+Se usa cuando:
 
-## 11.4. `hostCompareReduction`
+- un hilo cae fuera de rango;
+- un hueco de ventana no tiene vecino valido;
+- un bloque necesita inicializar posiciones vacias.
+
+### `hostCompareReduction`
 
 Es el comparador equivalente en CPU:
 
 - para maximo: `left > right ? left : right`
 - para minimo: `left < right ? left : right`
 
-Se usa al final de la variante 3.4.
+Solo se usa al final de la variante 3.4, cuando ya quedan pocos parciales en
+host.
 
-## 11.5. `phase03AtomicVariant`
+### `deviceCompareReduction`
 
-Es un wrapper host para las variantes:
+Es el comparador general en device. Todas las variantes lo reutilizan para no
+duplicar codigo:
+
+- `reductionBasic`
+- `reductionIntermediate`
+- `reductionPattern`
+- `warpReduceShared`
+- `computeWindowReductionFromGlobal`
+
+## 11.4. Helpers especificos de la reduccion
+
+### `computeWindowReductionFromGlobal`
+
+Este helper device solo se usa en la variante intermedia. Sirve para recomputar
+la ventana de un vecino cuando la pareja cruza el final del bloque y ese dato
+ya no puede leerse desde `sharedLocalBest`.
+
+Conceptualmente calcula:
+
+```text
+best(idx) = compare(data[idx-1], data[idx], data[idx+1])
+```
+
+aplicando el valor identidad cuando falta vecino.
+
+### `floorPowerOfTwo`
+
+Recibe un entero positivo y devuelve la mayor potencia de dos menor o igual que
+ese valor.
+
+Ejemplos:
+
+- `floorPowerOfTwo(300) = 256`
+- `floorPowerOfTwo(128) = 128`
+- `floorPowerOfTwo(7) = 4`
+
+Es importante porque la variante 3.4 necesita un tamaño de bloque potencia de
+dos para que el patrón de reducción por mitades quede limpio.
+
+### `computeReductionLaunchConfig`
+
+Esta funcion calcula la configuracion de lanzamiento especifica para
+`reductionPattern(...)`. No usa la misma logica que `computeLaunchConfig(...)`
+porque aqui cada bloque procesa hasta `2 * threadsPerBlock` elementos.
+
+Pasos:
+
+1. toma `g_deviceProp.maxThreadsPerBlock`;
+2. lo limita con `kReductionMaxThreads`;
+3. calcula la mayor potencia de dos menor o igual;
+4. fija `elementsPerBlock = threadsPerBlock * 2`;
+5. calcula:
+
+```text
+blocks = ceil(totalElements / elementsPerBlock)
+```
+
+### `warpReduceShared`
+
+Es el helper device que resuelve la reduccion final de la ultima warp usando
+shared memory volatil. En vez de seguir haciendo un `for` con
+`__syncthreads()`, reduce directamente el tramo final:
+
+- `+32`
+- `+16`
+- `+8`
+- `+4`
+- `+2`
+- `+1`
+
+La idea es esta:
+
+```mermaid
+flowchart LR
+    A[64 parciales] --> B[32]
+    B --> C[16]
+    C --> D[8]
+    D --> E[4]
+    E --> F[2]
+    F --> G[1]
+```
+
+En el código real solo se usa cuando `localIndex < 32`, es decir, en la última
+warp del bloque.
+
+## 11.5. Orquestador host: `phase03`
+
+`phase03(int columnOption, int reductionOption)` hace toda la coordinación
+general:
+
+1. elige la columna (`DEP_DELAY`, `ARR_DELAY` o `WEATHER_DELAY`);
+2. decide si la operación es maximo o minimo;
+3. compacta y trunca a `int`;
+4. calcula `LaunchConfig` para las variantes atómicas;
+5. reserva `deviceInput` y copia `inputValues`;
+6. ejecuta las cuatro variantes;
+7. imprime los cuatro resultados.
+
+### Importante
+
+`phase03(...)` es `void`, pero sus helpers internos devuelven `bool` para poder
+cortar el flujo si una variante falla. Esa distinción es deliberada:
+
+- API pública simple para el menú;
+- helpers internos con señal mínima de error.
+
+## 11.6. `phase03AtomicVariant`
+
+Este helper host implementa el esqueleto común de:
 
 - `Simple`
 - `Basic`
 - `Intermediate`
 
-Pasos:
+Pasos exactos:
 
-1. reserva `deviceResult`
-2. lo inicializa con la identidad
-3. lanza el kernel correcto
-4. sincroniza
-5. copia el resultado al host
-6. libera `deviceResult`
+1. reserva `deviceResult`;
+2. escribe en GPU la identidad (`INT_MIN` o `INT_MAX`);
+3. calcula `sharedBytes` si la variante lo necesita;
+4. lanza el kernel correspondiente;
+5. llama a `executeAndWait("Fase 03 atomica")`;
+6. copia el resultado final a host;
+7. libera `deviceResult`.
 
-## 11.6. `phase03ReductionVariant`
-
-Esta implementa la variante 3.4 completa.
-
-### Idea
-
-No reduce todo a un unico valor en un solo lanzamiento. Hace lanzamientos
-sucesivos:
-
-- entrada grande -> parciales
-- parciales -> parciales mas pequenos
-- cuando quedan `<= 10`, la CPU cierra el resultado final
-
-### Diagrama iterativo
+### Diagrama
 
 ```mermaid
 flowchart TD
-    A[Vector inicial en GPU] --> B[reductionPattern]
-    B --> C[Vector parcial]
-    C --> D{tamano > 10?}
-    D -- Si --> B
-    D -- No --> E[Copiar 10 o menos valores a CPU]
-    E --> F[hostCompareReduction]
+    A[phase03AtomicVariant] --> B[cudaMalloc deviceResult]
+    B --> C[cudaMemcpy identidad]
+    C --> D{Variante}
+    D --> E[reductionSimple]
+    D --> F[reductionBasic]
+    D --> G[reductionIntermediate]
+    E --> H[executeAndWait]
+    F --> H
+    G --> H
+    H --> I[cudaMemcpy resultado]
+    I --> J[cudaFree deviceResult]
 ```
 
-## 11.7. Variante 3.1: `reductionSimple`
+## 11.7. `phase03ReductionVariant`
 
-Algoritmo:
+Este helper host implementa la variante 3.4 completa.
 
-- cada hilo lee `data[idx]`
-- si es maximo -> `atomicMax(result, value)`
-- si es minimo -> `atomicMin(result, value)`
+### Idea
 
-### Caracteristicas
+No intenta obtener el resultado final en un solo kernel. En su lugar:
 
-- extremadamente simple;
-- no usa memoria compartida;
-- alta contencion sobre `result`.
+1. toma `deviceInput`;
+2. lanza `reductionPattern(...)` para generar parciales;
+3. esos parciales pasan a ser la nueva entrada;
+4. repite mientras `currentCount > kReductionCpuThreshold`;
+5. cuando quedan pocos valores, copia a CPU y cierra con `hostCompareReduction`.
 
-## 11.8. Variante 3.2: `reductionBasic`
+### Diagrama iterativo real
 
-Esta variante usa memoria compartida para una ventana:
+```mermaid
+flowchart TD
+    A[currentInput en GPU] --> B[computeReductionLaunchConfig]
+    B --> C[Reservar devicePartials]
+    C --> D[reductionPattern]
+    D --> E[executeAndWait]
+    E --> F{currentCount > 10?}
+    F -- Si --> G[currentInput = devicePartials]
+    G --> B
+    F -- No --> H[cudaMemcpy parciales a host]
+    H --> I[hostCompareReduction]
+```
 
-- anterior
-- actual
-- siguiente
+### Gestion de memoria
 
-### Estructura
+`phase03ReductionVariant(...)` usa dos ideas importantes:
+
+- `currentInput` apunta a la entrada de la iteración actual;
+- `ownsCurrentInput` indica si esa memoria debe liberarla la propia función.
+
+Eso permite encadenar parciales sin perder la referencia a la entrada inicial.
+
+## 11.8. Variante 3.1: `reductionSimple`
+
+La variante más directa:
+
+- cada hilo procesa un `data[idx]`;
+- si busca máximo, hace `atomicMax(result, value)`;
+- si busca mínimo, hace `atomicMin(result, value)`.
+
+### Patrón
+
+```text
+1 hilo -> 1 valor -> 1 operación atómica global
+```
+
+### Ventajas y límites
+
+- muy fácil de entender;
+- no necesita shared memory;
+- máxima contención sobre `result`.
+
+## 11.9. Variante 3.2: `reductionBasic`
+
+Usa una ventana compartida para que cada hilo compare:
+
+- el elemento anterior;
+- el actual;
+- el siguiente.
+
+### Layout de `sharedWindow`
 
 ```mermaid
 flowchart LR
-    A[sharedWindow[0]] --> B[valor anterior al bloque]
-    C[sharedWindow[1..blockDim]] --> D[valores actuales]
-    E[sharedWindow[valid+1]] --> F[valor siguiente al bloque]
+    A[sharedWindow[0]] --> B[Elemento anterior al bloque]
+    C[sharedWindow[1..validElements]] --> D[Valores del bloque]
+    E[sharedWindow[validElements+1]] --> F[Elemento siguiente al bloque]
 ```
 
-### Operacion local
+### Cálculo
 
 Cada hilo calcula:
 
 ```text
-best = compare(prev, current, next)
+bestValue = compare(prev, current, next)
 ```
 
-y luego publica `best` con atomoica global.
+y después publica ese mejor valor con una atómica global.
 
-### Que aporta
+### Qué enseña esta variante
 
-- introduce shared memory;
-- sigue siendo sencilla;
-- simula una reduccion local por vecindad.
+- uso básico de shared memory;
+- carga cooperativa con halo;
+- reducción local por vecindad, todavía con acumulador global.
 
-## 11.9. Variante 3.3: `reductionIntermediate`
+## 11.10. Variante 3.3: `reductionIntermediate`
 
-Esta variante anade una segunda zona de shared memory:
+Amplía la básica con una segunda zona de shared memory:
 
 - `sharedWindow`
 - `sharedLocalBest`
 
-Flujo:
+### Flujo real
 
-1. cada hilo calcula su mejor local de la ventana
-2. guarda ese valor en `sharedLocalBest`
-3. solo los indices globales pares publican por parejas
+1. todos los hilos cargan la ventana en `sharedWindow`;
+2. cada hilo calcula su mejor local;
+3. ese mejor local se guarda en `sharedLocalBest`;
+4. solo los índices globales pares continúan;
+5. cada hilo par combina su mejor con el de su vecino impar;
+6. el resultado de la pareja se publica con una atómica global.
 
 ### Diagrama
 
 ```mermaid
 flowchart TD
-    A[sharedWindow] --> B[mejor local por hilo]
+    A[sharedWindow] --> B[best local por hilo]
     B --> C[sharedLocalBest]
     C --> D{globalIndex par?}
-    D -- Si --> E[combinar propia pareja]
-    D -- No --> F[no publica]
+    D -- No --> E[Fin del hilo]
+    D -- Si --> F[Combinar pareja par-impar]
+    F --> G[atomicMax / atomicMin]
 ```
 
 ### Caso frontera
 
-Si la pareja cruza el final del bloque, entra en juego
-`computeWindowReductionFromGlobal()`, que recomputa el mejor local del vecino
-leyendo memoria global.
+Si el hilo impar de la pareja ya cae fuera del bloque válido, el hilo par no se
+queda sin información. Recalcula la ventana del vecino con
+`computeWindowReductionFromGlobal(...)` leyendo la memoria global.
 
-## 11.10. Variante 3.4: `reductionPattern`
+## 11.11. Variante 3.4: `reductionPattern`
 
-Es la reduccion clasica por mitades en shared memory.
+Esta es la variante más elaborada del proyecto.
 
-### Codigo conceptual
+### Qué hace cada hilo
 
-```cpp
-for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
-    if (localIndex < stride) {
-        sharedReduction[localIndex] =
-            deviceCompareReduction(sharedReduction[localIndex],
-                                   sharedReduction[localIndex + stride],
-                                   isMax);
-    }
-    __syncthreads();
-}
+Cada hilo parte de:
+
+```text
+baseIndex = blockIdx.x * (blockDim.x * 2) + localIndex
 ```
 
-### Interpretacion matematica
+Eso significa que un bloque de `T` hilos cubre hasta `2T` elementos.
 
-En cada iteracion el numero de candidatos se divide entre 2:
+Luego:
 
-- si hay 256 elementos
-- luego 128
-- luego 64
-- luego 32
-- ...
-- hasta 1 parcial por bloque
+1. toma `input[baseIndex]` si existe;
+2. toma `input[baseIndex + blockDim.x]` si existe;
+3. compara ambos y obtiene un parcial local;
+4. guarda ese parcial en `sharedReduction[localIndex]`.
 
-### Diagrama
+### Primera compresión: dos elementos por hilo
+
+```mermaid
+flowchart LR
+    A[input[i]] --> C[localBest hilo]
+    B[input[i + blockDim.x]] --> C
+    C --> D[sharedReduction[localIndex]]
+```
+
+Con esto, el tamaño efectivo ya se reduce a la mitad antes del árbol en shared
+memory.
+
+### Segunda compresión: árbol en shared memory
+
+Mientras `stride > 32`, cada hilo con `localIndex < stride` combina su parcial
+con el de su compañero a distancia `stride`.
+
+### Tercera compresión: reducción final por warp
+
+Cuando quedan 32 parciales o menos, entra `warpReduceShared(...)`. El último
+tramo se resuelve sin más `__syncthreads()`.
+
+### Esquema completo
 
 ```mermaid
 flowchart TD
-    A[256 valores] --> B[128 comparaciones]
-    B --> C[64 comparaciones]
-    C --> D[32 comparaciones]
-    D --> E[16]
-    E --> F[8]
-    F --> G[4]
-    G --> H[2]
-    H --> I[1 parcial]
+    A[2 elementos por hilo] --> B[sharedReduction]
+    B --> C[stride = blockDim/2]
+    C --> D[stride > 32?]
+    D -- Si --> E[Comparar con vecino a stride]
+    E --> C
+    D -- No --> F[warpReduceShared]
+    F --> G[sharedReduction[0]]
+    G --> H[output[blockIdx.x]]
 ```
 
-## 11.11. Comparacion entre variantes
+### Diferencia con la explicación antigua
 
-| Variante | Memoria compartida | Atomicas globales | Idea principal |
+Esta implementación no es solo "la reducción clásica por mitades". Hace tres
+cosas a la vez:
+
+- procesa dos elementos por hilo;
+- usa un árbol en shared memory;
+- remata con reducción warp-level.
+
+Por eso es más eficiente y también más compleja de entender.
+
+## 11.12. Comparación entre variantes
+
+| Variante | Memoria compartida | Atomicas globales | Patrón |
 |---|---|---|---|
-| Simple | No | Si | Cada hilo publica directamente |
-| Basica | Si | Si | Mejor de anterior-actual-siguiente |
-| Intermedia | Si | Si | Mejor local + publicacion por parejas |
-| Reduccion | Si | No | Reduccion por bloque y cierre iterativo |
+| Simple | No | Sí | 1 hilo -> 1 valor -> atómica global |
+| Básica | Sí | Sí | Ventana anterior-actual-siguiente |
+| Intermedia | Sí | Sí | Mejor local + combinación por parejas |
+| Reducción | Sí | No | 2 elementos por hilo + árbol + warp final |
+
+### Qué aporta cada una didácticamente
+
+- `Simple`: muestra la reducción más directa posible.
+- `Basic`: introduce halos y cooperación por bloque.
+- `Intermediate`: enseña una segunda capa de colaboración entre hilos vecinos.
+- `Pattern`: muestra un patrón de reducción más cercano a CUDA clásico.
 
 ---
 
@@ -1411,112 +1667,204 @@ flowchart TD
 
 ## 12.1. Objetivo
 
-Contar ocurrencias por aeropuerto:
+Construir un histograma de frecuencias por aeropuerto:
 
-- origen
-- destino
+- de origen;
+- o de destino.
 
-usando `SEQ_ID` en GPU y traduciendo a codigo solo en CPU.
+La fase cuenta en GPU usando enteros densificados y solo traduce a código
+textual en CPU al imprimir.
 
-## 12.2. Por que no se usan strings en GPU
+## 12.2. Preparación de datos: densificación
 
-Comparar y contar strings en GPU complicaria mucho:
+La Fase 04 no trabaja con los `SEQ_ID` brutos directamente. Antes, en
+`dataset_gpu.cu`, `buildDenseInput(...)` transforma:
+
+```text
+SEQ_ID real -> denseIndex consecutivo
+```
+
+y guarda también la inversa:
+
+```text
+denseToSeqId[denseIndex] = SEQ_ID real
+```
+
+### Ejemplo
+
+Si la columna original es:
+
+```text
+[12001, 12478, 12001, 13055]
+```
+
+la fase construye:
+
+```text
+denseToSeqId = [12001, 12478, 13055]
+denseInput   = [0, 1, 0, 2]
+```
+
+### Por qué no se usan strings en GPU
+
+Comparar y contar strings en GPU complicaría mucho:
 
 - longitud variable;
-- comparacion cara;
-- mas trafico de memoria.
+- más tráfico de memoria;
+- comparación más cara;
+- peor encaje con histogramas por índice.
 
-Por eso el programa trabaja con:
+Por eso el flujo real es:
 
-- `SEQ_ID` entero en GPU
-- `codigo` textual solo al imprimir
+- `SEQ_ID` densificado en GPU;
+- `codigo` textual solo en CPU.
+
+### Diagrama de densificación
+
+```mermaid
+flowchart LR
+    A[originSeqId / destSeqId] --> B[buildDenseInput]
+    B --> C[denseIndexBySeqId]
+    B --> D[denseInput por fila]
+    B --> E[denseToSeqId]
+    E --> F[idToCode en CPU]
+```
 
 ## 12.3. `phase04`
 
-Pasos:
+`phase04(int airportOption, int threshold)` es el orquestador host de la fase.
 
-1. decide si usar origen o destino
-2. elige:
+### Pasos reales
+
+1. decide si trabaja con origen o destino;
+2. selecciona:
    - `denseInput`
    - `denseToSeqId`
    - `idToCode`
-3. verifica `totalElements`, `totalBins` y `denseInput`
-4. verifica que el histograma cabe en shared memory
-5. reserva:
-   - `devicePartialHistograms`
-   - `deviceFinalHistogram`
-6. lanza `phase4SharedHistogramKernel`
-7. lanza `phase4MergeHistogramKernel`
-8. copia histograma a CPU
-9. llama a `printPhase4Histogram`
-
-La condicion:
+   - `totalElements`
+   - `totalBins`
+3. corta si no hay datos válidos:
 
 ```cpp
 if (totalElements <= 0 || totalBins <= 0 || denseInput == nullptr)
 ```
 
-no esta pensada como control de error CUDA, sino como cierre logico del flujo
-de preparacion. Si `subirDatasetAGPU(...)` no construyo entrada densa para
-origen o destino, `phase04(...)` interpreta correctamente que no hay histograma
-que lanzar.
+4. calcula la memoria compartida necesaria:
+
+```text
+sharedBytes = totalBins * sizeof(unsigned int)
+```
+
+5. comprueba que ese histograma parcial cabe en `g_deviceProp.sharedMemPerBlock`;
+6. reserva:
+   - `devicePartialHistograms`
+   - `deviceFinalHistogram`
+7. lanza `phase4SharedHistogramKernel(...)`;
+8. lanza `phase4MergeHistogramKernel(...)`;
+9. copia el histograma final a host;
+10. imprime el resultado con `printPhase4Histogram(...)`.
+
+### Importancia de `denseInput == nullptr`
+
+Esa condición no es un check de error CUDA, sino una continuación lógica de la
+preparación hecha en `subirDatasetAGPU(...)`.
+
+Si `buildDenseInput(...)` no encontró entradas válidas para origen o destino:
+
+- el vector denso queda vacío;
+- `dataset_gpu.cu` no reserva memoria para ese lado;
+- el puntero permanece en `nullptr`;
+- `phase04(...)` interpreta correctamente que no hay histograma que construir.
 
 ## 12.4. `phase4SharedHistogramKernel`
 
-Este kernel hace un histograma parcial por bloque.
+Este kernel calcula un histograma parcial por bloque usando shared memory.
 
-### Flujo
+### Qué hace
 
-1. reserva `sharedHistogram`
-2. lo inicializa a cero por franjas
-3. cada hilo procesa como mucho una fila
-4. hace `atomicAdd(&sharedHistogram[denseIndices[globalIndex]], 1U)`
-5. copia el histograma parcial del bloque a memoria global
+1. inicializa `sharedHistogram[bin] = 0` por franjas;
+2. cada hilo procesa como mucho una fila;
+3. si su índice global es válido, ejecuta:
+
+```cpp
+atomicAdd(&sharedHistogram[denseIndices[globalIndex]], 1U);
+```
+
+4. al final, el bloque vuelca su histograma parcial a memoria global.
+
+### Diagrama del histograma parcial
+
+```mermaid
+flowchart TD
+    A[sharedHistogram = 0] --> B[Leer denseIndices[globalIndex]]
+    B --> C[atomicAdd en bin compartido]
+    C --> D[sharedHistogram completo del bloque]
+    D --> E[Copiar a partialHistograms]
+```
+
+### Por qué shared memory aquí
+
+Porque varios hilos del mismo bloque pueden colaborar sobre un histograma
+pequeño y rápido antes de escribir en global. Eso reduce la presión directa
+sobre un único histograma global.
+
+## 12.5. `phase4MergeHistogramKernel`
+
+Este segundo kernel hace la fusión final. Aquí cada hilo representa un bin del
+histograma final.
+
+Para un bin dado:
+
+```text
+finalHistogram[bin] =
+    sum(partialHistograms[partialIndex * totalBins + bin])
+```
 
 ### Diagrama
 
 ```mermaid
-flowchart TD
-    A[Hilos del bloque] --> B[sharedHistogram = 0]
-    B --> C[Leer denseIndices[globalIndex]]
-    C --> D[atomicAdd bin en shared]
-    D --> E[Copiar sharedHistogram a partialHistograms]
-```
-
-## 12.5. `phase4MergeHistogramKernel`
-
-Un hilo por bin:
-
-- recorre todos los parciales de ese bin
-- los suma
-- escribe el resultado final
-
-Formula:
-
-```text
-finalHistogram[bin] = sum(partialHistograms[partialIndex * totalBins + bin])
+flowchart LR
+    A[Parcial bloque 0, bin k] --> D[Suma]
+    B[Parcial bloque 1, bin k] --> D
+    C[Parcial bloque 2, bin k] --> D
+    D --> E[finalHistogram[k]]
 ```
 
 ## 12.6. `printPhase4Histogram`
 
-Esta funcion ya trabaja solo en CPU.
+Esta función ya trabaja solo en CPU. Toma:
 
-Hace tres tareas:
+- `histogram`
+- `denseToSeqId`
+- `idToCode`
+- `threshold`
 
-1. decide cuantos aeropuertos superan el umbral
-2. calcula la longitud de cada barra
-3. traduce `denseIndex -> seqId -> codigo`
+y produce la salida textual final.
+
+### Tareas
+
+1. contar cuántos aeropuertos superan el umbral;
+2. encontrar `maximumShownCount`;
+3. traducir cada `denseIndex` a `seqId`;
+4. traducir `seqId` a `airportCode`;
+5. dibujar una barra proporcional con `#`.
 
 ### Escalado de barras
 
+La longitud base es:
+
 ```text
-barLength = histogram[denseIndex] * maxBarWidth / maximumShownCount
+barLength = count * maxBarWidth / maximumShownCount
 ```
 
 con:
 
 - `maxBarWidth = 40`
-- si `barLength == 0` y el conteo es positivo, fuerza `barLength = 1`
+- y una corrección visual:
+  - si el aeropuerto se muestra,
+  - su conteo es positivo,
+  - y la división da `0`,
+  - entonces se fuerza `barLength = 1`.
 
 ### Ejemplo
 
@@ -1525,27 +1873,43 @@ Si:
 - `maximumShownCount = 200`
 - `count = 50`
 
-Entonces:
+entonces:
 
 ```text
 barLength = 50 * 40 / 200 = 10
 ```
 
-## 12.7. Diagrama completo de la Fase 04
+## 12.7. Diagrama completo de Fase 04
 
 ```mermaid
 flowchart TD
-    A[g_originSeqId / g_destSeqId] --> B[buildDenseInput]
-    B --> C[denseInput]
-    B --> D[denseToSeqId]
-    C --> E[phase4SharedHistogramKernel]
-    E --> F[partialHistograms]
-    F --> G[phase4MergeHistogramKernel]
-    G --> H[finalHistogram]
-    H --> I[printPhase4Histogram]
-    D --> I
-    J[idToCode] --> I
+    A[originSeqId / destSeqId en host] --> B[buildDenseInput]
+    B --> C[denseInput persistente en GPU]
+    B --> D[denseToSeqId en host]
+    E[idToCode en host] --> J[printPhase4Histogram]
+    C --> F[phase4SharedHistogramKernel]
+    F --> G[partialHistograms]
+    G --> H[phase4MergeHistogramKernel]
+    H --> I[finalHistogram en host]
+    D --> J
+    I --> J
 ```
+
+## 12.8. Relación entre Fase 0 y Fase 04
+
+La Fase 04 depende mucho más de la preparación previa que las demás fases:
+
+- Fase 01 usa directamente una columna ya copiada;
+- Fase 02 usa una columna y un buffer linealizado;
+- Fase 03 se prepara una entrada temporal;
+- Fase 04 necesita:
+  - filtrar `SEQ_ID` inválidos;
+  - exigir que exista código asociado;
+  - densificar categorías;
+  - conservar el mapa inverso para la impresión.
+
+Por eso `buildDenseInput(...)` y los guards de tamaño 0 son parte esencial de
+la lógica de esta fase, no simple "código de soporte".
 
 ---
 
@@ -1619,6 +1983,17 @@ Este reparto refleja mejor el codigo actual:
 | Compartida | `sharedWindow`, `sharedLocalBest`, `sharedReduction`, `sharedHistogram` | Reducciones e histograma |
 | Host | vectores y mapas C++ | Carga, compactado, impresion |
 
+Ademas de esa memoria operativa, `comun.cu` declara cuatro punteros device que
+no participan en el flujo actual:
+
+- `d_originSeqId`
+- `d_destSeqId`
+- `d_originAirportCodes`
+- `d_destAirportCodes`
+
+Conviene tenerlos presentes al leer el inventario de globals, pero no deben
+confundirse con buffers realmente usados hoy por las fases.
+
 El uso de memoria CUDA se reparte por fase y por responsabilidad:
 
 - `parte1.cu` aloja el kernel de Fase 01;
@@ -1675,6 +2050,10 @@ Se usa para:
 - buffers de salida de Fase 02
 - entradas densas de Fase 04
 - parciales y resultados temporales de Fase 03 y Fase 04
+
+Tambien hay punteros device declarados sin uso operativo actual, como
+`d_originSeqId` o `d_destAirportCodes`, que forman parte del estado global pero
+no del flujo real de computacion.
 
 ### Memoria compartida
 
@@ -2013,9 +2392,11 @@ flowchart TD
     J --> O[phase03AtomicVariant]
     J --> P[phase03ReductionVariant]
     O --> Q[reductionSimple / reductionBasic / reductionIntermediate]
-    P --> R[reductionPattern]
-    K --> S[phase4SharedHistogramKernel]
-    K --> T[phase4MergeHistogramKernel]
+    P --> R[computeReductionLaunchConfig]
+    P --> S[reductionPattern]
+    S --> T[warpReduceShared]
+    K --> U[phase4SharedHistogramKernel]
+    K --> V[phase4MergeHistogramKernel]
 ```
 
 ## 15.2. Mapa por responsabilidades
@@ -2028,8 +2409,10 @@ flowchart TD
 | `phase02` | Host | Orquestar Fase 02 |
 | `phase03` | Host | Orquestar Fase 03 |
 | `phase04` | Host | Orquestar Fase 04 |
+| `computeReductionLaunchConfig` | Host | Ajustar el lanzamiento de la variante 3.4 |
 | `phase1DepartureDelayKernel` | Device | Filtro simple de salida |
 | `phase2ArrivalDelayKernel` | Device | Filtro con salida compactada |
+| `warpReduceShared` | Device | Cierre warp-level de la variante 3.4 |
 | `reduction*` | Device | Variantes de reduccion |
 | `phase4*HistogramKernel` | Device | Histograma parcial y merge |
 
